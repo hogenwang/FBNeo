@@ -1,0 +1,134 @@
+name: "versioned-release"
+
+on:
+  push:
+    branches: [ master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  determine_version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc_version.outputs.version }}
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next version
+        id: calc_version
+        run: |
+          latest=$(git tag --list 'v1.0.0.*' | sort -t. -k4 -n | tail -1)
+          if [ -z "$latest" ]; then
+            new_version="v1.0.0.1"
+          else
+            patch=$(echo "$latest" | sed 's/v1\.0\.0\.//')
+            new_patch=$((patch + 1))
+            new_version="v1.0.0.${new_patch}"
+          fi
+          echo "version=${new_version}" >> $GITHUB_OUTPUT
+          echo "Next version: ${new_version}"
+
+  build_windows_x86_64:
+    name: Build (Windows x86_64)
+    needs: determine_version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Install dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: msys2-devel base-devel binutils mingw-w64-x86_64-toolchain mingw-w64-x86_64-nasm zip wget
+          msystem: MINGW64
+
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Build
+        id: build
+        run: |
+          make -j$(nproc) mingw BUILD_X64_EXE=1 SKIPDEPEND=1 RELEASEBUILD=1
+          archive_file="fbneo-win64-${{ needs.determine_version.outputs.version }}.zip"
+          echo "archive_file=${archive_file}" >> $GITHUB_OUTPUT
+          zip --junk-paths "${archive_file}" fbneo64.exe src/license.txt fbahelpfilesrc/fbneo.chm whatsnew.html
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ${{ steps.build.outputs.archive_file }}
+          retention-days: 1
+
+  build_windows_x86_32:
+    name: Build (Windows x86_32)
+    needs: determine_version
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Install dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: msys2-devel base-devel binutils mingw-w64-i686-toolchain mingw-w64-i686-nasm zip wget
+          msystem: MINGW32
+
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Build
+        id: build
+        run: |
+          make -j$(nproc) mingw SKIPDEPEND=1 RELEASEBUILD=1
+          archive_file="fbneo-win32-${{ needs.determine_version.outputs.version }}.zip"
+          echo "archive_file=${archive_file}" >> $GITHUB_OUTPUT
+          zip --junk-paths "${archive_file}" fbneo.exe src/license.txt fbahelpfilesrc/fbneo.chm whatsnew.html
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_32
+          path: ${{ steps.build.outputs.archive_file }}
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: [ determine_version, build_windows_x86_64, build_windows_x86_32 ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+
+      - name: Download Windows x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ./artifacts
+
+      - name: Download Windows x86_32 artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x86_32
+          path: ./artifacts
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.determine_version.outputs.version }}
+        run: |
+          gh release create "${VERSION}" \
+            --title "FBNeo ${VERSION}" \
+            --target "${{ github.sha }}" \
+            --notes "FBNeo Windows build ${VERSION}" \
+            ./artifacts/*.zip
