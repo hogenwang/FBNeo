@@ -5511,9 +5511,9 @@ struct BurnDriver BurnDrvcv_bankbuild = {
     272, 228, 4, 3
 };
 
-// Barbarricade (HB, 06-03-26)
+// Barbarricade (HB, 06-17-26)
 static struct BurnRomInfo cv_barbarricadeRomDesc[] = {
-	{ "Barbarricade 06-03-26 (2026)(Jess Creations).rom",	32768, 0xbf40aaf7, BRF_PRG | BRF_ESS },
+	{ "Barbarricade 06-17-26 (2026)(Jess Creations).rom",	32768, 0xad6630ce, BRF_PRG | BRF_ESS },
 };
 
 STDROMPICKEXT(cv_barbarricade, cv_barbarricade, cv_coleco)
@@ -5521,7 +5521,7 @@ STD_ROM_FN(cv_barbarricade)
 
 struct BurnDriver BurnDrvcv_barbarricade = {
 	"cv_barbarricade", NULL, "cv_coleco", NULL, "2026",
-	"Barbarricade (HB, 06-03-26)\0", NULL, "Jess Creations", "ColecoVision",
+	"Barbarricade (HB, 06-17-26)\0", NULL, "Jess Creations", "ColecoVision",
 	NULL, NULL, NULL, NULL,
 	BDF_GAME_WORKING | BDF_HOMEBREW, 1, HARDWARE_COLECO, GBF_BREAKOUT, 0,
 	CVGetZipName, cv_barbarricadeRomInfo, cv_barbarricadeRomName, NULL, NULL, NULL, NULL, ColecoInputInfo, ColecoDIPInfo,
@@ -11988,6 +11988,24 @@ struct BurnDriver BurnDrvcv_tankmission = {
     CVGetZipName, cv_tankmissionRomInfo, cv_tankmissionRomName, NULL, NULL, NULL, NULL, ColecoInputInfo, ColecoDIPInfo,
     DrvInit, DrvExit, DrvFrame, TMS9928ADraw, DrvScan, NULL, TMS9928A_PALETTE_SIZE,
     272, 228, 4, 3
+};
+
+// Taz (HB, v0.97f)
+static struct BurnRomInfo cv_tazRomDesc[] = {
+	{ "Taz v0.97f (2026)(Electric Dreams).rom",	32768, 0xaf106afb, BRF_PRG | BRF_ESS },
+};
+
+STDROMPICKEXT(cv_taz, cv_taz, cv_coleco)
+STD_ROM_FN(cv_taz)
+
+struct BurnDriver BurnDrvcv_taz = {
+	"cv_taz", NULL, "cv_coleco", NULL, "2026",
+	"Taz (HB, v0.97f)\0", NULL, "Electric Dreams", "ColecoVision",
+	NULL, NULL, NULL, NULL,
+	BDF_GAME_WORKING | BDF_HOMEBREW, 1, HARDWARE_COLECO, GBF_ACTION, 0,
+	CVGetZipName, cv_tazRomInfo, cv_tazRomName, NULL, NULL, NULL, NULL, ColecoInputInfo, ColecoDIPInfo,
+	DrvInit, DrvExit, DrvFrame, TMS9928ADraw, DrvScan, NULL, TMS9928A_PALETTE_SIZE,
+	272, 228, 4, 3
 };
 
 // Telebunny (HB)
