@@ -1,6 +1,7 @@
 // Screen Window
 #include "burner.h"
 #include "pcecdlist.h"
+#include "segacdlist.h"
 #include <process.h>
 #include <shlobj.h>
 
@@ -16,6 +17,17 @@ static void SetPCECDTitle()
 {
 	TCHAR szText[1024] = _T("");
 	TCHAR* pszTitle = PceCDInfo_Text(DRV_FULLNAME);
+	_sntprintf(szText, _countof(szText), _T(APP_TITLE) _T(" v%.20s") _T(SEPERATOR_1) _T("%s") _T(SEPERATOR_1) _T("%s"), szAppBurnVer, BurnDrvGetText(DRV_FULLNAME), pszTitle ? pszTitle : FBALoadStringEx(hAppInst, IDS_UNIDENTIFIED_CD, true));
+	szText[_countof(szText) - 1] = _T('\0');
+	SetWindowText(hScrnWnd, szText);
+}
+#endif
+
+#ifdef BUILD_MEGADRIVE
+static void SetSegaCDTitle()
+{
+	TCHAR szText[1024] = _T("");
+	TCHAR* pszTitle = SegaCDInfo_Text(DRV_FULLNAME);
 	_sntprintf(szText, _countof(szText), _T(APP_TITLE) _T(" v%.20s") _T(SEPERATOR_1) _T("%s") _T(SEPERATOR_1) _T("%s"), szAppBurnVer, BurnDrvGetText(DRV_FULLNAME), pszTitle ? pszTitle : FBALoadStringEx(hAppInst, IDS_UNIDENTIFIED_CD, true));
 	szText[_countof(szText) - 1] = _T('\0');
 	SetWindowText(hScrnWnd, szText);
@@ -39,6 +51,208 @@ void NeoCDInfo_SetTitle()
 }
 #endif
 
+
+// ----------------------------------------------------------------------------
+// disc change (multi-disc games), for every cd system whose driver handles the tray
+
+#define CD_CHANGE_DISC_MAX	32
+
+static TCHAR szCDChangePath[CD_CHANGE_DISC_MAX][MAX_PATH];
+static TCHAR szCDChangeTitle[CD_CHANGE_DISC_MAX][CDLIST_TEXT_SIZE];
+static INT32 nCDChangeCount = 0;
+
+// discs of the group in a folder, returns the number of cd images seen
+static INT32 CDChangeScanDir(const TCHAR* pszDir, const TCHAR* pszGroup)
+{
+	static const TCHAR* pszPattern[] = { _T("*.cue"), _T("*.ccd"), _T("*.chd") };
+	INT32 nImages = 0;
+
+	for (INT32 i = 0; i < 3; i++) {
+		TCHAR szFind[MAX_PATH];
+		_sntprintf(szFind, MAX_PATH, _T("%s\\%s"), pszDir, pszPattern[i]);
+		szFind[MAX_PATH - 1] = _T('\0');
+
+		WIN32_FIND_DATA fd;
+		HANDLE hFind = FindFirstFile(szFind, &fd);
+		if (hFind == INVALID_HANDLE_VALUE) {
+			continue;
+		}
+
+		do {
+			if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+				continue;
+			}
+			nImages++;
+			if (nCDChangeCount >= CD_CHANGE_DISC_MAX) {
+				continue;
+			}
+
+			TCHAR szPath[MAX_PATH];
+			TCHAR szGroup[CDLIST_TEXT_SIZE];
+			_sntprintf(szPath, MAX_PATH, _T("%s\\%s"), pszDir, fd.cFileName);
+			szPath[MAX_PATH - 1] = _T('\0');
+
+			if (CDInfo_ImageDiscGroup(szPath, szGroup, CDLIST_TEXT_SIZE, szCDChangeTitle[nCDChangeCount], CDLIST_TEXT_SIZE) && !_tcsicmp(szGroup, pszGroup)) {
+				_tcscpy(szCDChangePath[nCDChangeCount++], szPath);
+			}
+		} while (FindNextFile(hFind, &fd));
+
+		FindClose(hFind);
+	}
+
+	return nImages;
+}
+
+// the folder of the running disc, and its sibling folders when each disc has its own folder (cue/bin sets)
+static void CDChangeFindDiscs(const TCHAR* pszGroup)
+{
+	TCHAR szDir[MAX_PATH];
+
+	nCDChangeCount = 0;
+
+	_tcscpy(szDir, CDEmuImage);
+	for (TCHAR* p = szDir; *p; p++) {
+		if (*p == _T('/')) *p = _T('\\');
+	}
+	TCHAR* pszSep = _tcsrchr(szDir, _T('\\'));
+	if (pszSep == NULL) {
+		_tcscpy(szDir, _T("."));
+	} else {
+		*pszSep = _T('\0');
+	}
+
+	if (CDChangeScanDir(szDir, pszGroup) > 2) {
+		return;
+	}
+
+	TCHAR szParent[MAX_PATH];
+	_tcscpy(szParent, szDir);
+	pszSep = _tcsrchr(szParent, _T('\\'));
+	if (pszSep == NULL) {
+		return;
+	}
+	*pszSep = _T('\0');
+	const TCHAR* pszCurrent = pszSep + 1;
+
+	TCHAR szFind[MAX_PATH];
+	_sntprintf(szFind, MAX_PATH, _T("%s\\*"), szParent);
+	szFind[MAX_PATH - 1] = _T('\0');
+
+	WIN32_FIND_DATA fd;
+	HANDLE hFind = FindFirstFile(szFind, &fd);
+	if (hFind == INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	do {
+		if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !_tcscmp(fd.cFileName, _T(".")) || !_tcscmp(fd.cFileName, _T("..")) || !_tcsicmp(fd.cFileName, pszCurrent)) {
+			continue;
+		}
+
+		TCHAR szSub[MAX_PATH];
+		_sntprintf(szSub, MAX_PATH, _T("%s\\%s"), szParent, fd.cFileName);
+		szSub[MAX_PATH - 1] = _T('\0');
+		CDChangeScanDir(szSub, pszGroup);
+	} while (nCDChangeCount < CD_CHANGE_DISC_MAX && FindNextFile(hFind, &fd));
+
+	FindClose(hFind);
+}
+
+static void CDChangeDisc(const TCHAR* pszPath)
+{
+	if (CDInfo_ChangeDisc(pszPath)) {
+		FBAPopupAddText(PUF_TEXT_DEFAULT, FBALoadStringEx(hAppInst, IDS_CD_CHANGE_ERROR, true), pszPath);
+		FBAPopupDisplay(PUF_TYPE_ERROR);
+		return;
+	}
+
+	ScrnTitle();
+}
+
+static void CDChangeOtherImage()
+{
+	TCHAR szFilter[100] = { 0 };
+	_stprintf(szFilter, _T("%s"), FBALoadStringEx(hAppInst, IDS_CD_SELECT_FILTER, true));
+	static const TCHAR szPattern[] = _T(" (*.cue,*.ccd,*.chd)\0*.cue;*.ccd;*.chd\0");
+	memcpy(szFilter + _tcslen(szFilter), szPattern, sizeof(szPattern));
+	TCHAR szTitle[100] = { 0 };
+	_stprintf(szTitle, _T("%s"), FBALoadStringEx(hAppInst, IDS_CD_SELECT_IMAGE_TITLE, true));
+
+	TCHAR szDir[MAX_PATH];
+	_tcscpy(szDir, CDEmuImage);
+	for (TCHAR* p = szDir; *p; p++) {
+		if (*p == _T('/')) *p = _T('\\');
+	}
+	TCHAR* pszSep = _tcsrchr(szDir, _T('\\'));
+	if (pszSep) {
+		*pszSep = _T('\0');
+	}
+
+	TCHAR szFile[MAX_PATH] = { 0 };
+	memset(&ofn, 0, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = hScrnWnd;
+	ofn.lpstrFile = szFile;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrTitle = szTitle;
+	ofn.lpstrFilter = szFilter;
+	ofn.lpstrInitialDir = pszSep ? szDir : NULL;
+	ofn.Flags = OFN_NOCHANGEDIR | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST;
+	ofn.lpstrDefExt = _T("cue");
+
+	if (GetOpenFileName(&ofn)) {
+		CDChangeDisc(szFile);
+	}
+}
+
+// lists the other discs of the game when it has several, any image can be inserted
+static void CDChangeDiscMenu()
+{
+	TCHAR szGroup[CDLIST_TEXT_SIZE] = { 0 };
+	if (CDInfo_DiscGroup()) {
+		_tcsncpy(szGroup, CDInfo_DiscGroup(), CDLIST_TEXT_SIZE - 1);
+		CDChangeFindDiscs(szGroup);
+	} else {
+		nCDChangeCount = 0;
+	}
+
+	if (nCDChangeCount == 0) {
+		CDChangeOtherImage();
+		return;
+	}
+
+	TCHAR szCurrent[MAX_PATH];
+	_tcscpy(szCurrent, CDEmuImage);
+	for (TCHAR* p = szCurrent; *p; p++) {
+		if (*p == _T('/')) *p = _T('\\');
+	}
+
+	HMENU hPopup = CreatePopupMenu();
+	for (INT32 i = 0; i < nCDChangeCount; i++) {
+		TCHAR szItem[CDLIST_TEXT_SIZE + MAX_PATH + 2];
+		const TCHAR* pszFile = _tcsrchr(szCDChangePath[i], _T('\\'));
+		_sntprintf(szItem, _countof(szItem), _T("%s\t%s"), szCDChangeTitle[i], pszFile ? pszFile + 1 : szCDChangePath[i]);
+		szItem[_countof(szItem) - 1] = _T('\0');
+		UINT nFlags = MF_STRING;
+		if (!_tcsicmp(szCDChangePath[i], szCurrent)) {
+			nFlags |= MF_CHECKED | MF_GRAYED;
+		}
+		AppendMenu(hPopup, nFlags, i + 1, szItem);
+	}
+	AppendMenu(hPopup, MF_SEPARATOR, 0, NULL);
+	AppendMenu(hPopup, MF_STRING, CD_CHANGE_DISC_MAX + 1, FBALoadStringEx(hAppInst, IDS_CD_CHANGE_OTHER, true));
+
+	POINT pt;
+	GetCursorPos(&pt);
+	INT32 nSelect = TrackPopupMenu(hPopup, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hScrnWnd, NULL);
+	DestroyMenu(hPopup);
+
+	if (nSelect >= 1 && nSelect <= nCDChangeCount) {
+		CDChangeDisc(szCDChangePath[nSelect - 1]);
+	} else if (nSelect == CD_CHANGE_DISC_MAX + 1) {
+		CDChangeOtherImage();
+	}
+}
 
 int OnMenuSelect(HWND, HMENU, int, HMENU, UINT);
 int OnInitMenuPopup(HWND, HMENU, UINT, BOOL);
@@ -71,6 +285,7 @@ void DisplayPopupMenu(int nMenu);
 // Double-clicking the titlebar, or clicking the Maximize button on titlebar
 // can also be problematic, sometimes creating a window that is too wide.
 
+typedef HRESULT (WINAPI *SetWindowThemeFn)(HWND, LPCWSTR, LPCWSTR);
 static HBITMAP hBezelBitmap = NULL;
 static int nBezelCacheX = 0;
 static int nBezelCacheY = 0;
@@ -130,6 +345,91 @@ static int OnRButtonDown(HWND, BOOL, int, int, UINT);
 static int OnDisplayChange(HWND, UINT, UINT, UINT);
 
 int OnNotify(HWND, int, NMHDR* lpnmhdr);
+
+void DrawItemType(LPDRAWITEMSTRUCT pdis, CurrentItemInfo ItemInfo)
+{
+	UINT ItemStateType = ItemInfo.menuItemTypeFlag;
+	switch (ItemStateType)
+    {
+		case MFT_SEPARATOR:
+		{
+			COLORREF bg = uiMenuItemColor;
+			HBRUSH hbr = CreateSolidBrush(bg);
+			FillRect(pdis->hDC, &pdis->rcItem, hbr);
+			DeleteObject(hbr);
+
+			int cy = (pdis->rcItem.top + pdis->rcItem.bottom) / 2;
+			HPEN pen = CreatePen(PS_SOLID, 1, (COLORREF)uiTextFontColor);
+			HPEN oldPen = (HPEN)SelectObject(pdis->hDC, pen);
+			MoveToEx(pdis->hDC, pdis->rcItem.left + 4, cy, NULL);
+			LineTo(pdis->hDC, pdis->rcItem.right - 4, cy);
+			SelectObject(pdis->hDC, oldPen);
+			DeleteObject(pen);
+			break;
+		}
+
+		case MFT_RADIOCHECK:
+		{
+			int cy = (pdis->rcItem.top + pdis->rcItem.bottom) / 2;
+			int cx = pdis->rcItem.left + 12;
+
+			HBRUSH dotBrush = CreateSolidBrush((COLORREF)uiTextFontColor);
+			HBRUSH oldBrush = (HBRUSH)SelectObject(pdis->hDC, dotBrush);
+
+			HPEN pen = CreatePen(PS_SOLID, 1, (COLORREF)uiTextFontColor);
+			HPEN oldPen = (HPEN)SelectObject(pdis->hDC, pen);
+
+			Ellipse(pdis->hDC, cx - 4.75, cy - 4.75, cx + 4.75, cy + 4.75);
+
+			SelectObject(pdis->hDC, oldPen);
+			SelectObject(pdis->hDC, oldBrush);
+			DeleteObject(pen);
+			
+			break;
+		}
+	}
+}
+
+void DrawItemState(LPDRAWITEMSTRUCT pdis, CurrentItemInfo ItemInfo)
+{
+    UINT ItemStateType = ItemInfo.menuItemStateFlag;
+
+	switch (ItemStateType)
+	{
+		case MFS_CHECKED:
+		{
+			if(ItemInfo.itemHasCheckMark)
+			{
+				int cy = (pdis->rcItem.top + pdis->rcItem.bottom) / 2;
+				int cx = pdis->rcItem.left + 12;
+
+				HPEN pen = CreatePen(PS_SOLID, 2, (COLORREF)uiTextFontColor);
+				HPEN oldPen = (HPEN)SelectObject(pdis->hDC, pen);
+
+				MoveToEx(pdis->hDC, cx - 5, cy,     NULL);
+				LineTo  (pdis->hDC, cx - 1, cy + 4);
+				LineTo  (pdis->hDC, cx + 6, cy - 5);
+
+				SelectObject(pdis->hDC, oldPen);
+				DeleteObject(pen);
+			}
+			else
+			{
+				int cy = (pdis->rcItem.top + pdis->rcItem.bottom) / 2;
+				int cx = pdis->rcItem.left + 12;
+				HBRUSH dotBrush = CreateSolidBrush((COLORREF)uiTextFontColor);
+				HBRUSH oldBrush = (HBRUSH)SelectObject(pdis->hDC, dotBrush);
+				HPEN oldPen = (HPEN)SelectObject(pdis->hDC, GetStockObject(NULL_PEN));
+				Ellipse(pdis->hDC, cx - 3, cy - 3, cx + 3, cy + 3);
+				SelectObject(pdis->hDC, oldBrush);
+				SelectObject(pdis->hDC, oldPen);
+				DeleteObject(dotBrush);
+				break;
+			}
+		}
+	}
+	
+}
 
 static bool UseDialogs()
 {
@@ -421,6 +721,7 @@ static int CreateDatfileWindows(int bType)
 	if (bType == DAT_NGP_ONLY) _sntprintf(szConsoleString, 64, _T(", NeoGeo Pocket Games only"));
 	if (bType == DAT_CHANNELF_ONLY) _sntprintf(szConsoleString, 64, _T(", Fairchild Channel F Games only"));
 	if (bType == DAT_ASTROHOME_ONLY) _sntprintf(szConsoleString, 64, _T(", Bally Astrocade Games only"));
+	if (bType == DAT_ATARI2600_ONLY) _sntprintf(szConsoleString, 64, _T(", Atari 2600 Games only"));
 
 	TCHAR szProgramString[25];
 	_sntprintf(szProgramString, 25, _T("ClrMame Pro XML"));
@@ -556,6 +857,8 @@ INT32 CreateAllDatfilesWindows(bool bSilent, const TCHAR* pszSpecDir)
 	
 	_sntprintf(szFilename, MAX_PATH, _T("%s") _T(APP_TITLE) _T(" v%.20s (%s%s).dat"), buffer, szAppBurnVer, szProgramString, _T(", Bally Astrocade Games only"));
 	create_datfile(szFilename, DAT_ASTROHOME_ONLY);
+	_sntprintf(szFilename, MAX_PATH, _T("%s") _T(APP_TITLE) _T(" v%.20s (%s%s).dat"), buffer, szAppBurnVer, szProgramString, _T(", Atari 2600 Games only"));
+	create_datfile(szFilename, DAT_ATARI2600_ONLY);
 
 
 	return nRet;
@@ -617,6 +920,137 @@ static LRESULT CALLBACK ScrnProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lPar
 			}
 			break;
 		}
+
+		case WM_MEASUREITEM:
+		{
+			LPMEASUREITEMSTRUCT pmis = (LPMEASUREITEMSTRUCT)lParam;
+			if (pmis->CtlType == ODT_MENU) {
+				CurrentItemInfo* data = (CurrentItemInfo*) pmis->itemData;
+
+				if (!data) { pmis->itemWidth = 20; pmis->itemHeight = 20; return TRUE; }
+
+				HDC hdc = GetDC(hWnd);
+				SIZE szLabel = { 0, 0 };
+        		SIZE szAccel = { 0, 0 };
+
+				TCHAR* rightAlignChar = _tcschr(data->sText, _T('\t'));
+				if (rightAlignChar) {
+					// in case a string contains the special char \t its necessary ot capture its position
+					// the string of the item will have normal behavior up to the \t char
+					// after \t we will align everything to the right
+					GetTextExtentPoint32(hdc, data->sText, (int)(rightAlignChar - data->sText), &szLabel);
+					GetTextExtentPoint32(hdc, rightAlignChar + 1, (int)_tcslen(rightAlignChar + 1), &szAccel);
+				} else {
+					//no \t found keep going as normal
+					GetTextExtentPoint32(hdc, data->sText, (int)_tcslen(data->sText), &szLabel);
+				}
+				ReleaseDC(hWnd, hdc);
+
+				int accelGap = szAccel.cx > 0 ? (szAccel.cx + 24) : 0; 
+				pmis->itemWidth  = szLabel.cx + 40 + accelGap;
+				pmis->itemHeight = (int)fmax(fmax(szLabel.cy, szAccel.cy), 20);
+			}
+			return TRUE;
+		}
+		
+		// doing a drawItem case to control the shading of the selected item
+		case WM_DRAWITEM:
+		{	
+			LPDRAWITEMSTRUCT pdis = (LPDRAWITEMSTRUCT)lParam;
+
+			CurrentItemInfo* data = (CurrentItemInfo*) pdis->itemData;
+
+			UINT uCurrentItemType = pdis->CtlType;
+
+			switch(uCurrentItemType)
+			{
+
+				case ODT_MENU:
+				{
+					BOOL bSelected = (pdis->itemState & ODS_SELECTED) != 0;
+
+					COLORREF clr;
+
+					if(bSelected) 
+					{
+						clr = uiSelectedMenuItemColor;
+					}
+					else
+					{
+						clr = uiMenuItemColor;
+					
+					}
+
+					HBRUSH hbr = CreateSolidBrush(clr);
+					FillRect(pdis->hDC, &pdis->rcItem, hbr);
+					DeleteObject(hbr);
+
+					// if the item has flags associate draw its state, separator lines are ignored because they cant have states
+					if (data->menuItemStateFlag != 0 && ((data->menuItemTypeFlag & MFT_SEPARATOR) == 0) ) 
+					{
+						DrawItemState(pdis, *data);
+					}	
+
+					if(data->menuItemTypeFlag != 0)
+					{
+						DrawItemType(pdis, *data);
+					}
+
+					SetBkMode(pdis->hDC, TRANSPARENT);
+					if( (pdis->itemState & (ODS_GRAYED | ODS_DISABLED)) != 0 )
+					{
+						SetTextColor(pdis->hDC,  GetSysColor(COLOR_GRAYTEXT));
+					}
+					else
+					{
+						SetTextColor(pdis->hDC, (COLORREF) uiTextFontColor);    
+					}        
+
+					TCHAR* pszText;
+
+					if(data)
+					{
+						pszText = data->sText;
+					}
+					else
+					{
+						pszText = nullptr;
+					}
+
+					RECT rcText = pdis->rcItem;
+					rcText.left += 24; // your existing dot/checkmark margin
+
+					TCHAR* rightAlignChar = _tcschr(pszText, _T('\t'));
+					if (rightAlignChar) {
+						// \t char found align the text to the right
+						DrawText(pdis->hDC, pszText, (int)(rightAlignChar - pszText), &rcText,
+								DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+
+						RECT rcAccel = pdis->rcItem;
+						rcAccel.right -= 8; 
+						DrawText(pdis->hDC, rightAlignChar + 1, -1, &rcAccel,
+								DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+					} else {
+						// no \t char keep goign as usual
+						DrawText(pdis->hDC, pszText, -1, &rcText,
+								DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+					}
+					break;
+				}
+				default:
+				{
+					COLORREF clr;
+
+					HBRUSH hbr = CreateSolidBrush(uiTextFontColor);
+
+					FillRect(pdis->hDC, &pdis->rcItem, hbr);
+					DeleteObject(hbr);
+					break;
+				}
+			}
+
+			return TRUE;
+	 	} 
 		// - dink - end
 		HANDLE_MSG(hWnd, WM_SIZE,			OnSize);
 		HANDLE_MSG(hWnd, WM_ENTERSIZEMOVE,	OnEnterSizeMove);
@@ -875,6 +1309,7 @@ static t_hw_Struct scrn_gamehw_cfg[] = {
 	{ "ngpc",		{ HARDWARE_SNK_NGP | 0x10000, 0 } },
 	{ "channelf",	{ HARDWARE_CHANNELF, 0 } },
 	{ "astrocade",	{ HARDWARE_ASTROHOME, 0 } },
+	{ "atari2600",	{ HARDWARE_ATARI2600, 0 } },
 	{ "cps1",		{ HARDWARE_CAPCOM_CPS1, HARDWARE_CAPCOM_CPS1_QSOUND, HARDWARE_CAPCOM_CPS1_GENERIC, HARDWARE_CAPCOM_CPSCHANGER, 0 } },
 	{ "cps2",		{ HARDWARE_CAPCOM_CPS2, 0 } },
 	{ "cps3",		{ HARDWARE_CAPCOM_CPS3, 0 } },
@@ -883,6 +1318,7 @@ static t_hw_Struct scrn_gamehw_cfg[] = {
 	{ "neogeo",		{ HARDWARE_SNK_NEOGEO, HARDWARE_SNK_MVS, HARDWARE_SNK_DEDICATED_PCB, 0 } },
 	{ "neogeocd",	{ HARDWARE_SNK_NEOCD, 0 } },
 	{ "pcecd",		{ HARDWARE_PCENGINE_PCE_CD, 0 } },
+	{ "segacd",		{ HARDWARE_SEGA_MEGACD, 0 } },
 	{ "arcade",		{ ~0, 0 } }, // default, if not found above
 	{ "\0", { 0 } } // end
 };
@@ -1391,6 +1827,9 @@ INT32 BurnerQuickLoad(const INT32 nMode, const TCHAR* pszSelect)
 				case CDLIST_PLATFORM_PCECD:
 					pszDrvName = _T("pce_scdsys");
 					break;
+				case CDLIST_PLATFORM_SEGACD:
+					pszDrvName = _T("md_segacd");
+					break;
 				default:
 					FBAPopupAddText(PUF_TEXT_DEFAULT, MAKEINTRESOURCE(IDS_ERR_CD_IMAGE_IDENTIFY), pszSelect);
 					FBAPopupDisplay(PUF_TYPE_ERROR);
@@ -1706,6 +2145,13 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			break;
 		}
 
+		case MENU_CD_CHANGE_DISC:
+			if (bDrvOkay && CDEmuIsTraySupported() && !is_netgame_or_recording()) {
+				AudBlankSound();
+				CDChangeDiscMenu();
+			}
+			break;
+
 		case MENU_CDIMAGE: {
 			nCDEmuSelect = 0;
 			TCHAR szFilter[100] = { 0 };
@@ -1851,6 +2297,32 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			break;
 
 		case MENU_INPUT_REDETECT:
+			POST_INITIALISE_MESSAGE;
+			break;
+
+		case MENU_HOTKEYS:
+			AudBlankSound();
+			if (UseDialogs()) {
+				InputSetCooperativeLevel(false, bAlwaysProcessKeyboardInput);
+				HotkeysCreate();
+				GameInpCheckMouse();
+			}
+			break;
+
+		case MENU_INPUT_RUMBLE:
+			bInputRumble = !bInputRumble;
+			if (!bInputRumble) {
+				InputStopRumble();
+			}
+			break;
+
+		case MENU_INP_PLUGIN_1:
+			InputSelect(0);
+			POST_INITIALISE_MESSAGE;
+			break;
+
+		case MENU_INP_PLUGIN_2:
+			InputSelect(1);
 			POST_INITIALISE_MESSAGE;
 			break;
 
@@ -2059,6 +2531,8 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			bVidDWMSync = !bVidDWMSync;
 			if (bVidDWMSync && bVidVSync)
 				bVidVSync = 0;
+			if (bVidDWMSync)
+				bVidVRR = 0;
 
 			POST_INITIALISE_MESSAGE;
 			break;
@@ -2083,11 +2557,11 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			VidSelect(4);
 			POST_INITIALISE_MESSAGE;
 			break;
-#if 0
-			case MENU_BLITTER_6:
+		case MENU_BLITTER_6:
 			VidSelect(5);
 			POST_INITIALISE_MESSAGE;
 			break;
+#if 0
 		case MENU_BLITTER_7:
 			VidSelect(6);
 			POST_INITIALISE_MESSAGE;
@@ -2381,6 +2855,85 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			break;
 		}
 
+		// Direct3D 11 blitter shaders
+		case MENU_D3D11_SHADER_LOAD: {
+			if (UseDialogs()) {
+				TCHAR szFile[MAX_PATH] = _T("");
+				TCHAR szDir[MAX_PATH] = _T("");
+
+				InputSetCooperativeLevel(false, bAlwaysProcessKeyboardInput);
+				AudBlankSound();
+
+				// start in the folder of the current shader, or support/shaders
+				if (szVidD3D11Shader[0]) {
+					_tcsncpy(szDir, szVidD3D11Shader, MAX_PATH - 1);
+					TCHAR* p = _tcsrchr(szDir, _T('\\'));
+					TCHAR* q = _tcsrchr(szDir, _T('/'));
+					if (q > p) p = q;
+					if (p) *p = 0; else szDir[0] = 0;
+				}
+				if (szDir[0] == 0) {
+					GetCurrentDirectory(MAX_PATH, szDir);
+					_tcsncat(szDir, _T("\\support\\shaders"), MAX_PATH - 1 - _tcslen(szDir));
+				}
+
+				OPENFILENAME ofn;
+				memset(&ofn, 0, sizeof(ofn));
+				ofn.lStructSize = sizeof(ofn);
+				ofn.hwndOwner = hScrnWnd;
+				ofn.lpstrFilter = _T("Shaders and presets (*.cgp, *.cg, *.hlsl, *.fx)\0*.cgp;*.cg;*.hlsl;*.fx\0Cg presets (*.cgp)\0*.cgp\0All files (*.*)\0*.*\0\0");
+				ofn.lpstrFile = szFile;
+				ofn.nMaxFile = MAX_PATH;
+				ofn.lpstrInitialDir = szDir;
+				ofn.lpstrTitle = _T("Load shader");
+				ofn.Flags = OFN_NOCHANGEDIR | OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+				if (GetOpenFileName(&ofn)) {
+					VidD3D11SetShader(szFile);
+				}
+
+				GameInpCheckMouse();
+			}
+			break;
+		}
+
+		case MENU_D3D11_SHADER_NONE:
+			VidD3D11SetShader(_T(""));
+			break;
+
+		case MENU_D3D11_SHADER_PARAMS: {
+			if (UseDialogs()) {
+				InputSetCooperativeLevel(false, bAlwaysProcessKeyboardInput);
+				AudBlankSound();
+				D3D11ShaderParamsDialog(hScrnWnd);
+				GameInpCheckMouse();
+			}
+			break;
+		}
+
+		case MENU_D3D11_SHADER_MRU_CLEAR:
+			for (int i = 0; i < D3D11_SHADER_MRU_SIZE; i++) {
+				szVidD3D11ShaderMRU[i][0] = 0;
+			}
+			break;
+
+		case MENU_D3D11_SHADER_MRU + 0:
+		case MENU_D3D11_SHADER_MRU + 1:
+		case MENU_D3D11_SHADER_MRU + 2:
+		case MENU_D3D11_SHADER_MRU + 3:
+		case MENU_D3D11_SHADER_MRU + 4:
+		case MENU_D3D11_SHADER_MRU + 5:
+		case MENU_D3D11_SHADER_MRU + 6:
+		case MENU_D3D11_SHADER_MRU + 7: {
+			int n = id - MENU_D3D11_SHADER_MRU;
+			if (n < D3D11_SHADER_MRU_SIZE && szVidD3D11ShaderMRU[n][0]) {
+				TCHAR szPath[MAX_PATH];
+				_tcscpy(szPath, szVidD3D11ShaderMRU[n]);
+				VidD3D11SetShader(szPath);
+			}
+			break;
+		}
+
 		case MENU_GAMMA_OTHER: {
 			if (UseDialogs()) {
 				double nOldGamma = nGamma;
@@ -2594,6 +3147,18 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			bVidVSync = !bVidVSync;
 			if (bVidVSync && bVidDWMSync)
 				bVidDWMSync = 0;
+			if (bVidVSync)
+				bVidVRR = 0;
+
+			POST_INITIALISE_MESSAGE;
+			break;
+
+		case MENU_VRR:
+			bVidVRR = !bVidVRR;
+			if (bVidVRR) {
+				bVidVSync = 0;
+				bVidDWMSync = 0;
+			}
 
 			POST_INITIALISE_MESSAGE;
 			break;
@@ -2614,6 +3179,11 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 
 		case MENU_AUD_PLUGIN_2:
 			AudSelect(1);
+			POST_INITIALISE_MESSAGE;
+			break;
+
+		case MENU_AUD_PLUGIN_3:
+			AudSelect(2);
 			POST_INITIALISE_MESSAGE;
 			break;
 
@@ -2651,6 +3221,25 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 		case MENU_XAUDIO_48000:
 			if (!bDrvOkay) {
 				nAudSampleRate[1] = 48000;
+				POST_INITIALISE_MESSAGE;
+			}
+			break;
+
+		case MENU_WASAPI_NOSOUND:
+			if (!bDrvOkay) {
+				nAudSampleRate[2] = 0;
+				POST_INITIALISE_MESSAGE;
+			}
+			break;
+		case MENU_WASAPI_44100:
+			if (!bDrvOkay) {
+				nAudSampleRate[2] = 44100;
+				POST_INITIALISE_MESSAGE;
+			}
+			break;
+		case MENU_WASAPI_48000:
+			if (!bDrvOkay) {
+				nAudSampleRate[2] = 48000;
 				POST_INITIALISE_MESSAGE;
 			}
 			break;
@@ -2695,6 +3284,10 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 
 		case MENU_XAUDIO_REVERB:
 			nAudDSPModule[1] ^= 2;
+			break;
+
+		case MENU_WASAPI_BASS:
+			nAudDSPModule[2] ^= 1;
 			break;
 
 		case MENU_WLOGSTART:
@@ -2814,7 +3407,29 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 		case MENU_DISABLEPLACEHOLDER:
 			ResetPlaceHolder();
 			POST_INITIALISE_MESSAGE;
+			uiOwnerDrawActive = TRUE;
 			break;
+		
+		case MENU_UI_LIGHT_MODE:
+ 			nUiColorTheme = uiLightModeCode;
+			UpdateUiColorMode(nUiColorTheme);
+			POST_INITIALISE_MESSAGE;
+			uiOwnerDrawActive = TRUE;
+			break;
+
+		case MENU_UI_DARK_MODE:
+			nUiColorTheme = uiDarkModeCode;
+			UpdateUiColorMode(nUiColorTheme);
+			POST_INITIALISE_MESSAGE;
+			uiOwnerDrawActive = TRUE;
+			break;	
+
+		case MENU_UI_DEFAULT_MODE:
+			uiOwnerDrawActive = FALSE;
+			nUiColorTheme = uiLightModeCode;
+			UpdateUiColorMode(nUiColorTheme);
+			POST_INITIALISE_MESSAGE;
+			break;	
 
 		case MENU_LANGUAGE_SELECT:
 			if (UseDialogs()) {
@@ -3123,6 +3738,12 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 		case MENU_CLRMAME_PRO_XML_ASTROHOME_ONLY:
 			if (UseDialogs()) {
 				CreateDatfileWindows(DAT_ASTROHOME_ONLY);
+			}
+			break;
+
+		case MENU_CLRMAME_PRO_XML_ATARI2600_ONLY:
+			if (UseDialogs()) {
+				CreateDatfileWindows(DAT_ATARI2600_ONLY);
 			}
 			break;
 
@@ -3843,8 +4464,9 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			}
 			break;
 		case 4:
+		case 5:
 			switch (id) {
-				// Options for the DirectX Graphics 9 Alternate blitter
+				// Options for the DirectX Graphics 9 Alternate blitter and the Direct3D 11 blitter (shared menu IDs)
 				case MENU_DX9_ALT_POINT:
 					bVidDX9Bilinear = 0;
 					POST_INITIALISE_MESSAGE;
@@ -4313,7 +4935,11 @@ int ScrnTitle()
 
 	// Create window title
 	if (bDrvOkay) {
-		int nGetTextFlags = (nLoadMenuShowY & (1<<31)) ? DRV_ASCIIONLY : 0; // (1<<31) ASCIIONLY from sel.cpp...
+
+		int nGetTextFlags = 0;
+		if ((pDataRomDesc == NULL) && (nLoadMenuShowY & (1<<31))) { // (1<<31) ASCIIONLY from sel.cpp...
+			nGetTextFlags = DRV_ASCIIONLY;
+		}
 
 		TCHAR* pszPosition = szText;
 		TCHAR* pszName = BurnDrvGetText(DRV_FULLNAME | nGetTextFlags);
@@ -4336,6 +4962,12 @@ int ScrnTitle()
 			return 0;
 		}
 #endif
+#ifdef BUILD_MEGADRIVE
+		if ((BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK) == HARDWARE_SEGA_MEGACD) {
+			SetSegaCDTitle();
+			return 0;
+		}
+#endif
 
 	} else {
 		_stprintf(szText, _T(APP_TITLE) _T( " v%.20s") _T(SEPERATOR_1) _T("[%s]"), szAppBurnVer, FBALoadStringEx(hAppInst, IDS_SCRN_NOGAME, true));
@@ -4349,6 +4981,7 @@ int ScrnTitle()
 // Init the screen window (create it)
 int ScrnInit()
 {
+
 	REBARINFO rebarInfo;
 	REBARBANDINFO rebarBandInfo;
 	RECT rect;
@@ -4378,6 +5011,7 @@ int ScrnInit()
 		0, 0, 0, 0,									   			// size of window
 		NULL, NULL, hAppInst, NULL);
 
+
 	if (hScrnWnd == NULL) {
 		ScrnExit();
 		return 1;
@@ -4398,22 +5032,36 @@ int ScrnInit()
 				0, 0, 0, 0,
 				hScrnWnd, NULL, hAppInst, NULL);
 
+			HMODULE hUxTheme = LoadLibrary(L"uxtheme.dll");
+			if (hUxTheme) {
+				SetWindowThemeFn pSetWindowTheme = 
+					(SetWindowThemeFn)GetProcAddress(hUxTheme, "SetWindowTheme");
+				if (pSetWindowTheme) {
+					pSetWindowTheme(hRebar, L"", L"");
+				}
+				FreeLibrary(hUxTheme);
+			}
+
+
 			rebarInfo.cbSize = sizeof(REBARINFO);
 			rebarInfo.fMask = 0;
 			rebarInfo.himl = NULL;
 
 			SendMessage(hRebar, RB_SETBARINFO, 0, (LPARAM)&rebarInfo);
 
-			// Add the menu toolbar to the rebar
+			//SendMessage(hRebar, RB_SETBKCOLOR, 0, (LPARAM)RGB(0, 255, 0));
+
+			//Add the menu toolbar to the rebar
 			GetWindowRect(hMenubar, &rect);
 
 			rebarBandInfo.cbSize		= sizeof(REBARBANDINFO);
-			rebarBandInfo.fMask			= RBBIM_CHILD | RBBIM_CHILDSIZE | RBBIM_SIZE | RBBIM_STYLE;// | RBBIM_BACKGROUND;
+			rebarBandInfo.fMask			= RBBIM_CHILD | RBBIM_CHILDSIZE | RBBIM_SIZE | RBBIM_STYLE | RBBIM_COLORS;// | RBBIM_BACKGROUND;
 			rebarBandInfo.fStyle		= 0;//RBBS_GRIPPERALWAYS;// | RBBS_FIXEDBMP;
 			rebarBandInfo.hwndChild		= hMenubar;
 			rebarBandInfo.cxMinChild	= 100;
 			rebarBandInfo.cyMinChild	= ((SendMessage(hMenubar, TB_GETBUTTONSIZE, 0, 0)) >> 16) + 1;
 			rebarBandInfo.cx			= rect.right - rect.left;
+    		rebarBandInfo.clrBack    = uiBackGroundColor;
 
 			SendMessage(hRebar, RB_INSERTBAND, (WPARAM)-1, (LPARAM)&rebarBandInfo);
 

@@ -84,6 +84,13 @@ static INT32 NEO_RASTER_IRQ_TWEAK = 0; // spinmast prefers offset of 3 here.
 
 #define NEO_HREFRESH (15625.0)
 #define NEO_VREFRESH (NEO_HREFRESH / 264.0)
+
+// The watchdog is clocked from the same master clock as the 68K, so its timeout is a fixed
+// number of 68K cycles (~0.128s at 12MHz), independent of the CPU speed adjustment.
+// Games use it as a protection (busy loop expected to be interrupted by a watchdog reset,
+// flag written to SRAM 0xD00100 otherwise), a timeout scaled with the overclock defeats it.
+#define NEO_WATCHDOG_CYCLES ((INT32)(12000000.0 / NEO_VREFRESH) * 8)
+
 #define NEO_CDVREFRESH (6041957.0 / (264 * 384))
 
 // If defined, enable emulation of the watchdog timer (timing doesn't match real hardware 100%)
@@ -1365,7 +1372,7 @@ INT32 NeoScan(INT32 nAction, INT32* pnMin)
 					bMemoryCardInserted = false;
 
 					// If a card is inserted, determine the size
-					if (*((UINT16*)NeoMemoryCard) != 0x8000) {
+					if (BURN_ENDIAN_SWAP_INT16(*((UINT16*)NeoMemoryCard)) != 0x8000) {
 						INT32 nSize = (NeoMemoryCard[21] << 8) | NeoMemoryCard[23];
 						if (nSize >= 0x1000) {
 							ba.nLen = nSize;
@@ -1910,10 +1917,58 @@ static inline void SendSoundCommand(const UINT8 nCommand)
 	// cphd: ugh.
 }
 
+// NeoTap multitap: on each port, output bit 1 alone (0x380001) selects P3/P4, any
+// other value selects P1/P2 (games read the ports without writing first in 2P mode).
+// Bit 2 is looped back on the port's Select line, the AES BIOS uses it to detect
+// a mahjong panel, which is how the NeoTap is reported to games (BIOS_P1STATUS = 3).
+static UINT8 NeoTrisReadJoy(INT32 nPort)
+{
+	INT32 nSel = (nInputSelect >> (nPort * 3)) & 0x07;
+
+	return ~NeoInput[nPort + (((nSel & 3) == 2) ? 8 : 0)];
+}
+
+static UINT8 NeoTrisReadStatusB()
+{
+	UINT8 nData = NeoInput[2] & 0xf0;
+
+	for (INT32 nPort = 0; nPort < 2; nPort++) {
+		INT32 nSel = (nInputSelect >> (nPort * 3)) & 0x07;
+		INT32 nShift = nPort * 2;
+
+		nData |= NeoInput[((nSel & 3) == 2) ? 10 : 2] & (3 << nShift);
+		if (nSel & 4) nData |= 2 << nShift;
+	}
+
+	return ~nData;
+}
+
+// NEO-FTC1B (kizuna4p): output bit 0 (0x380001) selects P1/P2 or P3/P4 on both
+// ports, bit 2 is looped back on button A (P1/P2) or button B (P3/P4).
+static UINT8 NeoKizuna4PReadJoy(INT32 nPort)
+{
+	UINT8 nData = NeoInput[nPort + ((nInputSelect & 1) ? 8 : 0)];
+
+	if (nInputSelect & 4) nData |= 0x10 << (nInputSelect & 1);
+
+	return ~nData;
+}
+
+static UINT8 NeoKizuna4PReadStatusB()
+{
+	return ~((NeoInput[2] & 0xf0) | (NeoInput[(nInputSelect & 1) ? 10 : 2] & 0x05));
+}
+
 static UINT8 ReadInput1(INT32 nOffset)
 {
 	switch (nOffset) {
 		case 0x00:
+			if (nNeoControlConfig == HARDWARE_SNK_NEOTAP) {
+				return NeoTrisReadJoy(0);
+			}
+			if (nNeoControlConfig == HARDWARE_SNK_NEOFTC1B) {
+				return NeoKizuna4PReadJoy(0);
+			}
 //			bprintf(PRINT_NORMAL, _T(" -- bank %d inputP0[0x%02X] read (%i).\n"), 0, nInputSelect, SekTotalCycles());
 			return ~NeoInputBank[nJoyport0[nInputSelect & 0x07]];
 
@@ -1938,6 +1993,12 @@ static UINT8 ReadInput1(INT32 nOffset)
 static UINT8 ReadInput2(INT32 nOffset)
 {
 	if ((nOffset & 1) == 0) {
+		if (nNeoControlConfig == HARDWARE_SNK_NEOTAP) {
+			return NeoTrisReadJoy(1);
+		}
+		if (nNeoControlConfig == HARDWARE_SNK_NEOFTC1B) {
+			return NeoKizuna4PReadJoy(1);
+		}
 //		bprintf(PRINT_NORMAL, _T(" -- bank %d inputP1[0x%02X] read.\n"), 0, nInputSelect);
 		return ~NeoInputBank[nJoyport1[(nInputSelect >> 3) & 0x07]];
 	}
@@ -1948,6 +2009,12 @@ static UINT8 ReadInput2(INT32 nOffset)
 static UINT8 ReadInput3(INT32 nOffset)
 {
 	if ((nOffset & 1) == 0) {
+		if (nNeoControlConfig == HARDWARE_SNK_NEOTAP) {
+			return NeoTrisReadStatusB();
+		}
+		if (nNeoControlConfig == HARDWARE_SNK_NEOFTC1B) {
+			return NeoKizuna4PReadStatusB();
+		}
 //		bprintf(PRINT_NORMAL, " -- input 2 read.\n");
 		return ~NeoInputBank[2];
 	}
@@ -4103,19 +4170,21 @@ static INT32 NeoInitCommon()
 	NEO_RASTER_IRQ_TWEAK = 0;
 
 	// These games rely on reading the line counter for synchronising raster effects
-	if (!strcmp(BurnDrvGetTextA(DRV_NAME), "moshougi")) {
+	const static char * drv_name   = BurnDrvGetTextA(DRV_NAME);
+	const static char * drv_parent = BurnDrvGetTextA(DRV_PARENT);
+	if (!strcmp(drv_name, "moshougi")) {
 		bRenderLineByLine = true;
 	}
-	if (!strcmp(BurnDrvGetTextA(DRV_NAME), "neodrift")) {
+	if (!strcmp(drv_name, "neodrift")) {
 		bRenderLineByLine = true;
 	}
-	if (!strcmp(BurnDrvGetTextA(DRV_NAME), "zedblade")) {
+	if (!strcmp(drv_name, "zedblade")) {
 		bRenderLineByLine = true;
 	}
-	if (!strcmp(BurnDrvGetTextA(DRV_NAME), "crswd2bl")) {
+	if (!strcmp(drv_name, "crswd2bl") || (drv_parent && !strcmp(drv_parent, "crswd2bl"))) {
 		bRenderLineByLine = true;
 	}
-	if (!strcmp(BurnDrvGetTextA(DRV_NAME), "spinmast")) {
+	if (!strcmp(drv_name, "spinmast")) {
 		NEO_RASTER_IRQ_TWEAK = 3; // fix glitches along the bottom of screen in the water level.
 	}
 
@@ -4676,7 +4745,9 @@ INT32 NeoFrame()
 			break;
 		}
 
-		case HARDWARE_SNK_4_JOYSTICKS: {							// Four joystick controllers
+		case HARDWARE_SNK_4_JOYSTICKS:								// Four joystick controllers
+		case HARDWARE_SNK_NEOTAP:									// Four joysticks through NeoTap
+		case HARDWARE_SNK_NEOFTC1B: {								// Four joysticks through NEO-FTC1B
 
 			NeoStandardInputs(0);
 			NeoStandardInputs(1);
@@ -4776,12 +4847,6 @@ INT32 NeoFrame()
 		}
 	}
 
-	// note: Many neogeo games will be blocked on an anti-piracy screen or a black screen when the cpu is overclocked,
-	//       this is especially true for mslug games, one such case is mslug2 at both 0x200 and 0x400.
-	//       This seems directly related to SRAM writing, because getting the SRAM generated once at 0x100
-	//       and overclocking later works fine, meaning booting games with a forced overclock as it was done prior to
-	//       https://github.com/finalburnneo/FBNeo/commit/600088b8122d9977d3ae020dcd4101a3d5092a4d is not acceptable
-	//       (dozens of those mslug hacks wouldn't boot)
 	if (nPrevBurnCPUSpeedAdjust != nBurnCPUSpeedAdjust) {
 		bprintf(0, _T("\n---init cycles etc ---\n"));
 		// 68K CPU clock is 12MHz, modified by nBurnCPUSpeedAdjust
@@ -4818,7 +4883,7 @@ INT32 NeoFrame()
 #if defined EMULATE_WATCHDOG
 	// If the watchdog isn't reset every 8 frames, reset the system
 	// This can't be 100% accurate, as the 68000 instruction timings are not 100%
-	if ((nNeoSystemType & NEO_SYS_CART) && nNeoWatchdog > nCyclesTotal[0] * 8) {
+	if ((nNeoSystemType & NEO_SYS_CART) && nNeoWatchdog > NEO_WATCHDOG_CYCLES) {
 		if (bDisableNeoWatchdog == false) {
 #if 1 && defined FBNEO_DEBUG
 			SekOpen(0);

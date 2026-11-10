@@ -2419,6 +2419,8 @@ static INT32 OpwolfDoReset()
 	MSM5205ResetWrite(0, 1);
 	MSM5205ResetWrite(1, 1);
 
+	BurnRecoilReset();
+
 	nCyclesExtra[0] = nCyclesExtra[1] = nCyclesExtra[2] = nCyclesExtra[3] = 0;
 
 	return 0;
@@ -2725,6 +2727,7 @@ static void __fastcall Opwolf68KWriteWord(UINT32 a, UINT16 d)
 	switch (a) {
 		case 0x380000: {
 			PC090OJSpriteCtrl = (d & 0xe0) >> 5;
+			BurnRecoilLine(0, d & 3);	// MOTOR1/MOTOR2 -> Uzi recoil piston
 			return;
 		}
 
@@ -2834,6 +2837,7 @@ static void __fastcall Opwolfb68KWriteWord(UINT32 a, UINT16 d)
 	switch (a) {
 		case 0x380000: {
 			PC090OJSpriteCtrl = (d & 0xe0) >> 5;
+			BurnRecoilLine(0, d & 3);	// MOTOR1/MOTOR2 -> Uzi recoil piston
 			return;
 		}
 
@@ -3391,7 +3395,7 @@ static void __fastcall Volfied68KWriteWord(UINT32 a, UINT16 d)
 	if (a >= 0x400000 && a <= 0x47ffff) {
 		UINT16 *Ram = (UINT16*)TaitoVideoRam;
 		INT32 Offset = (a - 0x400000) >> 1;
-		Ram[Offset] = (Ram[Offset] & ~VolfiedVidMask) | (d & VolfiedVidMask);
+		Ram[Offset] = BURN_ENDIAN_SWAP_INT16((BURN_ENDIAN_SWAP_INT16(Ram[Offset]) & ~VolfiedVidMask) | (d & VolfiedVidMask));
 		return;
 	}
 
@@ -4601,13 +4605,14 @@ static INT32 OpwolfInit()
 	nTaitoCyclesTotal[1] = 4000000 / 60;
 
 	UINT16 *Rom = (UINT16*)Taito68KRom1;
-	OpWolfGunXOffset = 0xec - (Rom[0x03ffb0 / 2] & 0xff);
-	OpWolfGunYOffset = 0x1c - (Rom[0x03ffae / 2] & 0xff);
+	OpWolfGunXOffset = 0xec - (BURN_ENDIAN_SWAP_INT16(Rom[0x03ffb0 / 2]) & 0xff);
+	OpWolfGunYOffset = 0x1c - (BURN_ENDIAN_SWAP_INT16(Rom[0x03ffae / 2]) & 0xff);
 
 	cchip_init();
 
 	// Reset the driver
 	TaitoResetFunction = OpwolfDoReset;
+	BurnRecoilInit(1, RECOIL_MACHINEGUN);
 	TaitoResetFunction();
 
 	return 0;
@@ -4728,6 +4733,7 @@ static INT32 OpwolfbInit()
 
 	// Reset the driver
 	TaitoResetFunction = OpwolfDoReset;
+	BurnRecoilInit(1, RECOIL_MACHINEGUN);
 	TaitoResetFunction();
 
 	return 0;
@@ -5239,6 +5245,8 @@ static INT32 TaitoMiscExit()
 	OpWolfGunXOffset = 0;
 	OpWolfGunYOffset = 0;
 
+	BurnRecoilExit();
+
 	DariusADPCMCommand = 0;
 	DariusNmiEnable = 0;
 	DariusCoinWord = 0;
@@ -5645,7 +5653,7 @@ static void TopspeedDrawSprites(INT32 /*PriorityDraw*/)
 			px = (xFlip) ?  (7 - k) : (k);
 			py = (yFlip) ? (15 - j) : (j);
 
-			Code = SpriteMap[MapOffset + (py << 3) + px];
+			Code = BURN_ENDIAN_SWAP_INT16(SpriteMap[MapOffset + (py << 3) + px]);
 
 			if (Code & 0x8000) {
 				BadChunks += 1;
@@ -5758,14 +5766,14 @@ static INT32 VolfiedDraw()
 	if (VolfiedVidCtrl & 0x01) p += 0x20000;
 	for (INT32 y = 0; y < nScreenHeight + 8; y++) {
 		for (INT32 x = 1; x < nScreenWidth + 1; x++) {
-			INT32 Colour = (p[x] << 2) & 0x700;
+			INT32 Colour = (BURN_ENDIAN_SWAP_INT16(p[x]) << 2) & 0x700;
 
-			if (p[x] & 0x8000) {
-				Colour |= 0x800 | ((p[x] >> 9) & 0xf);
+			if (BURN_ENDIAN_SWAP_INT16(p[x]) & 0x8000) {
+				Colour |= 0x800 | ((BURN_ENDIAN_SWAP_INT16(p[x]) >> 9) & 0xf);
 
-				if (p[x] & 0x2000) Colour &= ~0xf;
+				if (BURN_ENDIAN_SWAP_INT16(p[x]) & 0x2000) Colour &= ~0xf;
 			} else {
-				Colour |= p[x] & 0xf;
+				Colour |= BURN_ENDIAN_SWAP_INT16(p[x]) & 0xf;
 			}
 
 			if ((y - 8) >= 0 && (y - 8) < nScreenHeight) {
@@ -5838,6 +5846,8 @@ static INT32 TaitoMiscFrame()
 	}
 
 	if (pBurnDraw) BurnDrvRedraw();
+
+	BurnRecoilUpdate();
 
 	return 0;
 }
@@ -6010,6 +6020,7 @@ static INT32 TaitoMiscScan(INT32 nAction, INT32 *pnMin)
 		if (TaitoNumMSM5205) MSM5205Scan(nAction, pnMin);
 
 		if (bUseGuns) BurnGunScan();
+		BurnRecoilScan(nAction);
 		if (bUseShifter) BurnShiftScan(nAction);
 
 		SCAN_VAR(TaitoCpuACtrl);

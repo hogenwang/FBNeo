@@ -1227,6 +1227,9 @@
     <ClCompile Include="..\..\src\burn\drv\capcom\d_cps2.cpp">
       <Filter>Burn\drv\capcom</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\burn\drv\capcom\d_cps2_custom.cpp">
+      <Filter>Burn\drv\capcom</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\burn\drv\capcom\fcrash_snd.cpp">
       <Filter>Burn\drv\capcom</Filter>
     </ClCompile>
@@ -3014,6 +3017,9 @@
     </ClCompile>
     <ClCompile Include="..\..\src\burn\snd\timeplt_snd.cpp">
       <Filter>burn\snd</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\burn\drv\megadrive\segacd.cpp">
+      <Filter>Burn\drv\megadrive</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\burn\drv\megadrive\stm95.cpp">
       <Filter>Burn\drv\megadrive</Filter>

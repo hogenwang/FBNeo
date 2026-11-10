@@ -95,6 +95,13 @@ static UINT8 __fastcall gunbuster_read_byte(UINT32 address)
 
 static void __fastcall gunbuster_write_long(UINT32 address, UINT32 data)
 {
+	if (address == 0x380000) {
+		// motor control: bit 24 = p1 gun recoil, bit 16 = p2 gun recoil, bit 18 = hit lamp
+		BurnRecoilLine(0, data & (1 << 24));
+		BurnRecoilLine(1, data & (1 << 16));
+		return;
+	}
+
 	bprintf (0, _T("WL: %5.5x, %8.8x\n"), address, data);
 }
 
@@ -108,7 +115,9 @@ static void __fastcall gunbuster_write_word(UINT32 address, UINT16 data)
 	switch (address)
 	{
 		case 0x380000:
-			// motor control (not used in FBA)
+			// motor control, upper word: bit 8 = p1 gun recoil, bit 0 = p2 gun recoil
+			BurnRecoilLine(0, data & 0x0100);
+			BurnRecoilLine(1, data & 0x0001);
 		return;
 	}
 
@@ -169,6 +178,8 @@ static INT32 DrvDoReset(INT32 full_reset)
 	}
 
 	gun_interrupt_timer = -1;
+
+	BurnRecoilReset();
 
 	HiscoreReset();
 
@@ -316,6 +327,7 @@ static INT32 DrvInit()
 	TaitoF3ES5506RomSize = 0x800000;
 
 	BurnGunInit(2, true);
+	BurnRecoilInit(2, RECOIL_HANDGUN);
 
 	DrvDoReset(1);
 
@@ -332,6 +344,7 @@ static INT32 DrvExit()
 	EEPROMExit();
 
 	BurnGunExit();
+	BurnRecoilExit();
 
 	BurnFree(TaitoMem);
 
@@ -344,9 +357,9 @@ static void DrvPaletteUpdate()
 
 	for (INT32 i = 0; i < 0x2000/2; i++)
 	{
-		UINT8 r = (p[i] >> 10) & 0x1f;
-		UINT8 g = (p[i] >>  5) & 0x1f;
-		UINT8 b = (p[i] >>  0) & 0x1f;
+		UINT8 r = (BURN_ENDIAN_SWAP_INT16(p[i]) >> 10) & 0x1f;
+		UINT8 g = (BURN_ENDIAN_SWAP_INT16(p[i]) >>  5) & 0x1f;
+		UINT8 b = (BURN_ENDIAN_SWAP_INT16(p[i]) >>  0) & 0x1f;
 
 		r = (r << 3) | (r >> 2);
 		g = (g << 3) | (g >> 2);
@@ -373,19 +386,19 @@ static void draw_sprites(int x_offs,int y_offs)
 
 	for (offs = (0x2000/4-4);offs >= 0;offs -= 4)
 	{
-		data = spriteram32[offs+0];
+		data = BURN_ENDIAN_SWAP_INT32(spriteram32[offs+0]);
 		data = (data << 16) | (data >> 16);
 		flipx =    (data & 0x00800000) >> 23;
 		zoomx =    (data & 0x007f0000) >> 16;
 		tilenum =  (data & 0x00007fff);
 
-		data = spriteram32[offs+2];
+		data = BURN_ENDIAN_SWAP_INT32(spriteram32[offs+2]);
 		data = (data << 16) | (data >> 16);
 		priority = (data & 0x000c0000) >> 18;
 		color =    (data & 0x0003fc00) >> 10;
 		x =        (data & 0x000003ff);
 
-		data = spriteram32[offs+3];
+		data = BURN_ENDIAN_SWAP_INT32(spriteram32[offs+3]);
 		data = (data << 16) | (data >> 16);
 		dblsize =  (data & 0x00040000) >> 18;
 		flipy =    (data & 0x00020000) >> 17;
@@ -423,7 +436,7 @@ static void draw_sprites(int x_offs,int y_offs)
 			if (flipx)  px = dimension-1-k;
 			if (flipy)  py = dimension-1-j;
 
-			code = spritemap[map_offset + px + (py<<(dblsize+1))];
+			code = BURN_ENDIAN_SWAP_INT16(spritemap[map_offset + px + (py<<(dblsize+1))]);
 
 			if (code==0xffff) {
 				continue;
@@ -577,6 +590,8 @@ static INT32 DrvFrame()
 		BurnDrvRedraw();
 	}
 
+	BurnRecoilUpdate();
+
 	return 0;
 }
 
@@ -605,6 +620,7 @@ static INT32 DrvScan(INT32 nAction, INT32 *pnMin)
 		EEPROMScan(nAction, pnMin);
 
 		BurnGunScan();
+		BurnRecoilScan(nAction);
 
 		SCAN_VAR(gun_interrupt_timer);
 	}

@@ -33,6 +33,7 @@
 #include "m68000_debug.h"
 #include "i2ceeprom.h" // i2c eeprom for MD
 #include "burn_gun.h" // menacer, justifier
+#include "segacd.h"
 
 UINT8 MegadriveUnmappedRom = 0xff;
 
@@ -67,7 +68,7 @@ static INT32 SekCyclesDoneFrameF() { return ( (SekCycleCnt - SekCycleCntDELTA) -
 #define SekCyclesBurn(c)        { SekCycleCnt += c; }
 #define SekEndRun(after)        { SekCycleCnt -= m68k_ICount - (after); m68k_ICount = after; }
 
-static void SekRunM68k(INT32 cyc)
+static void SekRunM68kSlice(INT32 cyc)
 {
 	INT32 cyc_do;
 
@@ -79,6 +80,24 @@ static void SekRunM68k(INT32 cyc)
 	}
 
 	m68k_ICount = 0;
+}
+
+// Sega CD: the sub cpu catches up with the main cpu in small slices
+#define SEGACD_SLICE	122
+
+static void SekRunM68k(INT32 cyc)
+{
+	if (SegaCDMode) {
+		while (cyc > 0) {
+			INT32 slice = (cyc > SEGACD_SLICE) ? SEGACD_SLICE : cyc;
+			SekRunM68kSlice(slice);
+			SegaCDRunSub(SekCyclesDoneFrame());
+			cyc -= slice;
+		}
+		return;
+	}
+
+	SekRunM68kSlice(cyc);
 }
 
 static UINT64 z80_cycle_cnt;
@@ -275,10 +294,19 @@ static INT32 dma_xfers = 0; // vdp dma
 static INT32 BlankedLine = 0;
 static INT32 interlacemode2 = 0;
 
+// VSRAM writes done once the next line's display has started, kept out of that line (Puggsy FMV)
+static INT32 vsram_late_count = 0;
+static UINT8 vsram_late_idx[0x40];
+static UINT16 vsram_late_val[0x40];
+static void VSRAMLateWrite(INT32 idx);
+
 static UINT8 Hardware;
 static UINT8 bNoDebug = 0;
 static INT32 bForce3Button = 0;
 INT32 psolarmode = 0; // pier solar
+static INT32 SegaCDCart = 0; // cartridge boot with the mega cd at 0x400000 (mode 1): 2 pier solar
+static INT32 SegaCDCartDisc = 0; // hdd index of the disc
+static UINT8 *SegaCDCartBios = NULL;
 static INT32 TeamPlayerMode = 0;
 static INT32 FourWayPlayMode = 0;
 
@@ -290,9 +318,16 @@ static void __fastcall MegadriveWriteByte(UINT32 sekAddress, UINT8 byteValue); /
 static UINT8 __fastcall MegadriveReadByte(UINT32 address);
 
 #include "paprium.h"
+#include "megasd.h"
 
 static void MegadriveCheckHardware()
 {
+	if (SegaCDMode && !SegaCDCart) {
+		Hardware = SegaCDGetHardware();
+		bprintf(PRINT_IMPORTANT, _T("Emulating %s Mega CD / Sega CD\n"), ((Hardware & 0xc0) == 0xc0) ? _T("Europe PAL") : ((Hardware & 0x80) ? _T("USA NTSC") : _T("Japan NTSC")));
+		return;
+	}
+
 	Hardware = MegadriveDIP[0] & 0xe0;
 	if (MegadriveDIP[0] & 0x01) {
 		// Auto Detect Region and SECAM
@@ -382,6 +417,8 @@ static void MegadriveCheckHardware()
 		Hardware |= MegadriveDIP[0] & 0x20;
 	}
 
+	if (SegaCDCart) Hardware &= ~0x20; // mega cd attached
+
 	if ((Hardware & 0xc0) == 0xc0) {
 		bprintf(PRINT_IMPORTANT, _T("Emulating Europe PAL Machine\n"));
 	} else {
@@ -411,7 +448,7 @@ inline static void CalcCol(INT32 index, UINT16 nColour)
 	INT32 g = (nColour & 0x00e0) >> 4; 	// Green
 	INT32 b = (nColour & 0x0e00) >> 8;	// Blue
 
-	RamPal[index] = nColour & 0xeee;
+	RamPal[index] = BURN_ENDIAN_SWAP_INT16(nColour & 0xeee);
 
 	// Normal Color
 	MegadriveCurPal[index + 0x00] = BurnHighCol(color_ramp[r], color_ramp[g], color_ramp[b], 0);
@@ -752,6 +789,11 @@ static void DmaSlow(INT32 len)
 	if ((source & 0xe00000) == 0xe00000) { // RAM
 		pd    = (UINT16 *)(Ram68K + (source & 0xfffe));
 		pdend = (UINT16 *)(Ram68K + 0x10000);
+	} else if (SegaCDMode && (source & 0xc00000) == (SegaCDCart ? 0x400000 : 0)) { // Sega CD: bios, prg-ram window, word ram
+		fromrom = 1;
+		source &= ~1;
+		// dma from word ram responds with a one-access delay
+		if ((source & 0x3c0000) == 0x200000) source -= 2;
 	} else if( source < RomSize) {	// ROM
 		if (papriummode || psolarmode) fromrom = 1;
 		fromrom = 1;
@@ -762,7 +804,7 @@ static void DmaSlow(INT32 len)
 	} else return; // Invalid source address
 
 	// overflow protection, might break something..
-	if (len > pdend - pd) {
+	if (pd && len > pdend - pd) {
 		len = pdend - pd;
 		//bprintf(0, _T("DmaSlow() overflow(!).\n"));
 	}
@@ -785,10 +827,10 @@ static void DmaSlow(INT32 len)
 				}
 				source+=2;
 			} else {
-				d = *pd++;
+				d = BURN_ENDIAN_SWAP_INT16(*pd++);
 			}
 			if(a&1) d=(d<<8)|(d>>8);
-			r[a>>1] = (UINT16)d; // will drop the upper bits
+			r[a>>1] = BURN_ENDIAN_SWAP_INT16((UINT16)d); // will drop the upper bits
 			// AutoIncrement
 			a = (UINT16)(a+inc);
 			// didn't src overlap?
@@ -810,9 +852,9 @@ static void DmaSlow(INT32 len)
 				}
 				source+=2;
 			} else {
-				d = *pd++;
+				d = BURN_ENDIAN_SWAP_INT16(*pd++);
 			}
-			CalcCol( a2>>1, BURN_ENDIAN_SWAP_INT16(d) );
+			CalcCol( a2>>1, d );
 			//pd++;
 			// AutoIncrement
 			a2+=inc;
@@ -835,9 +877,9 @@ static void DmaSlow(INT32 len)
 				}
 				source+=2;
 			} else {
-				d = *pd++;
+				d = BURN_ENDIAN_SWAP_INT16(*pd++);
 			}
-			r[(a2>>1)&0x3f] = (d&0x7ff);//(UINT16)d;
+			r[(a2>>1)&0x3f] = BURN_ENDIAN_SWAP_INT16(d&0x7ff);//(UINT16)d;
 			// AutoIncrement
 			a2 = (a2+inc)&0xffff;
 			// didn't src overlap?
@@ -852,7 +894,12 @@ static void DmaSlow(INT32 len)
       a |= RamVReg->addr_u << 16;
       for(; len; len--)
       {
-        VideoWrite128(a, *pd++);
+        if (pd == NULL) {
+          VideoWrite128(a, SekReadWord(source));
+          source += 2;
+        } else {
+          VideoWrite128(a, BURN_ENDIAN_SWAP_INT16(*pd++));
+        }
         // AutoIncrement
         a = (a + inc) & 0x1ffff;
       }
@@ -860,6 +907,7 @@ static void DmaSlow(INT32 len)
       break;
 
 	}
+
 	// remember addr
 	RamVReg->addr = (UINT16)a;
 	UpdateDMARegs();
@@ -929,7 +977,7 @@ static void DmaFill(INT32 data)
 	RamVReg->rendstatus |= PDRAW_DIRTY_SPRITES;
 }
 
-static void CommandChange()
+static void CommandChange(INT32 can_dma)
 {
 	//struct MegadrivePicoVideo *pvid=&Pico.video;
 	UINT32 cmd = RamVReg->command;
@@ -950,7 +998,7 @@ static void CommandChange()
 	//dprintf("addr set: %04x", addr);
 
 	// Check for dma:
-	if (cmd & 0x80) {
+	if ((cmd & 0x80) && can_dma) {
 		// Command DMA
 		if ((RamVReg->reg[1] & 0x10) == 0) return; // DMA not enabled
 
@@ -1057,6 +1105,32 @@ struct h_ { UINT16 hres; UINT8 hint; UINT8 start; UINT8 end; };
 
 static const h_ hints[2] = { {256, 0x85, 0x94, 0xe9}, {320, 0xa5, 0xb7, 0xe5} };
 
+static void VSRAMLateWrite(INT32 idx)
+{
+	INT32 cyc = SekCyclesLine();
+	if (cyc < 400 || cyc >= 512) return;
+
+	const UINT8 *hc = (RamVReg->reg[12] & 1) ? hcounts_40 : hcounts_32;
+	if (hc[cyc] >= 0x80) return; // display of the next line not started yet
+
+	for (INT32 i = 0; i < vsram_late_count; i++)
+		if (vsram_late_idx[i] == idx) return;
+
+	vsram_late_idx[vsram_late_count] = idx;
+	vsram_late_val[vsram_late_count] = RamSVid[idx];
+	vsram_late_count++;
+}
+
+// exchanges the late values with the ones they replaced
+static void VSRAMLateSwap()
+{
+	for (INT32 i = 0; i < vsram_late_count; i++) {
+		UINT16 t = RamSVid[vsram_late_idx[i]];
+		RamSVid[vsram_late_idx[i]] = vsram_late_val[i];
+		vsram_late_val[i] = t;
+	}
+}
+
 static UINT16 __fastcall MegadriveVideoReadWord(UINT32 sekAddress)
 {
 	if (sekAddress > 0xC0001F)
@@ -1137,7 +1211,8 @@ static void __fastcall MegadriveVideoWriteWord(UINT32 sekAddress, UINT16 wordVal
 	switch (sekAddress & 0x1c) {
 	case 0x00:	// data
 		if (RamVReg->pending) {
-			CommandChange();
+			// only the first half of a command was written: dma is only started by the second half
+			CommandChange(0);
 			RamVReg->pending = 0;
 		}
 		if ((RamVReg->command & 0x80) && (RamVReg->reg[1]&0x10) && (RamVReg->reg[0x17]>>6)==2) {
@@ -1179,6 +1254,8 @@ static void __fastcall MegadriveVideoWriteWord(UINT32 sekAddress, UINT16 wordVal
 				CalcCol((RamVReg->addr >> 1) & 0x003f, wordValue);
 				break;
 			case 5:
+				// limited to Sega CD for safety, but should be valid for regular MD games too
+				if (SegaCDMode) VSRAMLateWrite((RamVReg->addr >> 1) & 0x003f);
 				RamSVid[(RamVReg->addr >> 1) & 0x003f] = BURN_ENDIAN_SWAP_INT16(wordValue & 0x7ff);
 				break;
 			case 0x81: {
@@ -1199,7 +1276,7 @@ static void __fastcall MegadriveVideoWriteWord(UINT32 sekAddress, UINT16 wordVal
 			RamVReg->command &= 0xffff0000;
 			RamVReg->command |= wordValue;
 			RamVReg->pending = 0;
-			CommandChange();
+			CommandChange(1);
 		} else {
 			if((wordValue & 0xc000) == 0x8000) {
 				INT32 num = (wordValue >> 8) & 0x1f;
@@ -1603,6 +1680,14 @@ static INT32 MegadriveResetDo()
 	m68k_megadrive_sr_checkint_mode(1);
 	SekClose();
 
+	if (SegaCDMode) {
+		SegaCDReset();
+	}
+
+	if (megasdmode) {
+		megasd_reset();
+	}
+
 	ZetOpen(0);
 	ZetReset();
 	ZetClose();
@@ -1621,6 +1706,10 @@ static INT32 MegadriveResetDo()
 #endif
 
 	MegadriveCheckHardware();
+
+	if (SegaCDMode) {
+		SegaCDSetPAL(Hardware & 0x40);
+	}
 
 	if (last_hardware != Hardware) {
 		bprintf(0, _T("**  Megadrive Region/Hardware change, %dhz\n"), (Hardware & 0x40) ? 50 : 60);
@@ -1707,11 +1796,13 @@ static INT32 MegadriveResetDo()
 	RamVReg->rendstatus = 0;
 	bMegadriveRecalcPalette = 1;
 	interlacemode2 = 0;
+	vsram_late_count = 0;
 
 	SekCyclesReset();
 	z80CyclesReset();
 
 	md_eeprom_stm95_reset();
+	if (SegaCDCart == 2) md_eeprom_stm95_map_banks();
 	{
 		RamIO[1] = RamIO[2] = RamIO[3] = 0xff; // picodrive
 
@@ -1731,7 +1822,13 @@ static INT32 __fastcall MegadriveIrqCallback(INT32 irq)
 	case 4:	RamVReg->pending_ints  =  0x00; break;
 	case 6:	RamVReg->pending_ints &= ~0x20; break;
 	}
-	SekSetIRQLine(0, CPU_IRQSTATUS_NONE);
+	// a pending h-int stays asserted once the v-int is acknowledged (SoulStar demo)
+	// limited to Sega CD for safety, but should be valid for regular MD games too
+	if (SegaCDMode && irq == 6 && (RamVReg->pending_ints & 0x10) && (RamVReg->reg[0] & 0x10)) {
+		SekSetIRQLine(4, CPU_IRQSTATUS_ACK);
+	} else {
+		SekSetIRQLine(0, CPU_IRQSTATUS_NONE);
+	}
 	return M68K_INT_ACK_AUTOVECTOR;
 }
 
@@ -1966,11 +2063,11 @@ static UINT16 __fastcall LK3ReadWord(UINT32 address)
 {
 	if (address < 0x100000) { // banked rom access (15 - 1 because indexing UINT16 array instead of byte)
 		UINT16 *Rom = (UINT16*)RomMain;
-		return Rom[((address >> 1) | (RamMisc->L3Bank << (15 - 1))) & (RomSize - 1)];
+		return BURN_ENDIAN_SWAP_INT16(Rom[((address >> 1) | (RamMisc->L3Bank << (15 - 1))) & (RomSize - 1)]);
 	}
 	if (address < 0x400000) { // normal rom access
 		UINT16 *Rom = (UINT16*)RomMain;
-		return Rom[(address >> 1) & (RomSize - 1)];
+		return BURN_ENDIAN_SWAP_INT16(Rom[(address >> 1) & (RomSize - 1)]);
 	}
 
 	if (address >= 0x600000 && address <= 0x6fffff) {
@@ -2527,7 +2624,7 @@ static UINT16 __fastcall Mc12in1ReadWordRom(UINT32 sekAddress)
 {
 	if (sekAddress < 0x200000) {
 		UINT16 *Rom = (UINT16*)RomMain;
-		return Rom[((RamMisc->MapperBank[0] * 0x20000) + sekAddress) >> 1];
+		return BURN_ENDIAN_SWAP_INT16(Rom[((RamMisc->MapperBank[0] * 0x20000) + sekAddress) >> 1]);
 	} else {
 		return 0xffff;
 	}
@@ -2781,7 +2878,7 @@ static void flashrom_write(UINT16 address, UINT16 data)
 		case 0xa0:
 			//bprintf(0, _T("----------------flash write word %x  ->  %x\n"), address, data);
 			UINT16 *Ram = (UINT16*)SRam;
-			Ram[(address) >> 1] = data;
+			Ram[(address) >> 1] = BURN_ENDIAN_SWAP_INT16(data);
 
 			flashrom_busy = (flashrom_chiptype == S29GL) ? 0 : 8;
 			flashrom_cmd = 0;
@@ -2815,7 +2912,7 @@ static UINT16 __fastcall sot4w_readword(UINT32 address)
 	}
 
 	UINT16 *Ram = (UINT16*)RomMain;
-	rc = Ram[(address & 0x7fffff) >> 1];
+	rc = BURN_ENDIAN_SWAP_INT16(Ram[(address & 0x7fffff) >> 1]);
 	return rc;
 }
 
@@ -3386,10 +3483,10 @@ static UINT16 __fastcall MegadriveSRAMReadWord(UINT32 sekAddress)
 {
 	if (RamMisc->SRamActive) {
 		UINT16 *Ram = (UINT16*)SRam;
-		return Ram[(sekAddress - RamMisc->SRamStart) >> 1];
+		return BURN_ENDIAN_SWAP_INT16(Ram[(sekAddress - RamMisc->SRamStart) >> 1]);
 	} else {
 		UINT16 *Rom = (UINT16*)RomMain;
-		return Rom[sekAddress >> 1];
+		return BURN_ENDIAN_SWAP_INT16(Rom[sekAddress >> 1]);
 	}
 }
 
@@ -3408,7 +3505,7 @@ static void __fastcall MegadriveSRAMWriteWord(UINT32 sekAddress, UINT16 wordValu
 	if (RamMisc->SRamActive) {
 		if (!RamMisc->SRamReadOnly) {
 			UINT16 *Ram = (UINT16*)SRam;
-			Ram[(sekAddress - RamMisc->SRamStart) >> 1] = wordValue;
+			Ram[(sekAddress - RamMisc->SRamStart) >> 1] = BURN_ENDIAN_SWAP_INT16(wordValue);
 			return;
 		}
 	}
@@ -3492,7 +3589,7 @@ static UINT16 __fastcall x200000EEPROMReadWord(UINT32 sekAddress)
 
 	if (sekAddress < 0x300000) {
 		UINT16 *Rom = (UINT16*)RomMain;
-		return Rom[sekAddress >> 1];
+		return BURN_ENDIAN_SWAP_INT16(Rom[sekAddress >> 1]);
 	} else {
 		return 0xffff;
 	}
@@ -3800,6 +3897,18 @@ INT32 MegadriveInitPaprium()
 
 INT32 MegadriveInitPsolar()
 {
+	// enhanced soundtrack disc selected and present: cartridge boot with the mega cd (mode 1)
+	INT32 disc = (MegadriveDIP[1] >> 4) & 3;
+	if (disc) {
+		TCHAR path[MAX_PATH];
+		if (BurnHDDGetPath(disc - 1, _T(".chd"), path) == 0) {
+			SegaCDCart = 2;
+			SegaCDCartDisc = disc - 1;
+			return MegadriveInitSegaCD();
+		}
+		bprintf(PRINT_ERROR, _T("Pier Solar: the selected disc is missing, running without the Mega CD\n"));
+	}
+
 	psolarmode = 1;
 
 	INT32 rc = MegadriveInit();
@@ -3825,6 +3934,14 @@ INT32 MegadriveInitColocodx()
 	return rc;
 }
 
+INT32 MegadriveInitSegaCD()
+{
+	SegaCDMode = 1;
+	SegaCDMainCycles = SekCyclesDoneFrameF;
+
+	return MegadriveInit();
+}
+
 INT32 MegadriveInit()
 {
 	BurnAllocMemIndex();
@@ -3835,8 +3952,22 @@ INT32 MegadriveInit()
 
 	memset(RomMain, MegadriveUnmappedRom, MAX_CARTRIDGE_SIZE);
 
-	MegadriveLoadRoms(0);
-	if (MegadriveLoadRoms(1)) return 1;
+	if (SegaCDCart) {
+		// the cd image is the hdd, the bios (roms 0x80+) follows the console region
+		if (hddcd_open(SegaCDCartDisc)) return 1;
+		MegadriveLoadRoms(0);
+		if (MegadriveLoadRoms(1)) return 1;
+		MegadriveCheckHardware();
+		SegaCDCartBios = (UINT8*)BurnMalloc(0x20000);
+		if (SegaCDLoadBios(SegaCDCartBios, 0x80, ((Hardware & 0xc0) == 0xc0) ? 1 : ((Hardware & 0x80) ? 0 : 2))) return 1;
+	} else if (SegaCDMode) {
+		if (SegaCDLoadBios(RomMain, 0, -1)) return 1;
+		RomNum = 1;
+		RomSize = 0x20000;
+	} else {
+		MegadriveLoadRoms(0);
+		if (MegadriveLoadRoms(1)) return 1;
+	}
 
 	{
 		SekInit(0, 0x68000);										// Allocate 68000
@@ -3905,8 +4036,14 @@ INT32 MegadriveInit()
 	SN76496SetBuffered(SekCyclesDoneFrameF, OSC_NTSC / 7);
 	SN76496SetRoute(0, 0.50, BURN_SND_ROUTE_BOTH);
 
-	MegadriveSetupSRAM();
-	SetupCustomCartridgeMappers();
+	if (SegaCDMode) {
+		if (SegaCDInit(SegaCDCart ? SegaCDCartBios : RomMain, SegaCDCart)) return 1;
+		if (SegaCDCart == 2) md_eeprom_stm95_init_scd(RomMain);
+	} else {
+		MegadriveSetupSRAM();
+		SetupCustomCartridgeMappers();
+		if (megasd_init()) return 1;
+	}
 
 	if (MegadriveCallback) MegadriveCallback();
 
@@ -3960,6 +4097,14 @@ INT32 MegadriveExit()
 		sot4wmode = 0;
 	}
 
+	if (SegaCDMode) {
+		SegaCDExit();
+	}
+
+	megasd_exit();
+	hddcd_close();
+	BurnFree(SegaCDCartBios);
+
 	if (has_gun != 0) {
 		BurnGunExit();
 
@@ -3995,6 +4140,8 @@ INT32 MegadriveExit()
 
 	psolarmode = 0;
 	colocodxmode = 0;
+	SegaCDCart = 0;
+	SegaCDCartDisc = 0;
 
 	return 0;
 }
@@ -4144,7 +4291,7 @@ static void DrawStrip(struct MegadriveTileStrip *ts, INT32 lflags, INT32 cellski
   {
     UINT32 pack;
 
-    code = RamVid[ts->nametab + (tilex & ts->xmask)];
+    code = BURN_ENDIAN_SWAP_INT16(RamVid[ts->nametab + (tilex & ts->xmask)]);
     if (code == blank)
       continue;
 	if ((code >> 15) | (lflags & LF_FORCE)) { // high priority tile
@@ -4164,7 +4311,7 @@ static void DrawStrip(struct MegadriveTileStrip *ts, INT32 lflags, INT32 cellski
       pal=((code>>9)&0x30)|sh;
     }
 
-    pack = *(UINT32 *)(RamVid + addr);
+    pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + addr));
     if (!pack) {
       blank = code;
       continue;
@@ -4199,7 +4346,7 @@ static void DrawStripVSRam(struct MegadriveTileStrip *ts, INT32 plane_sh, INT32 
     int adj = ((ts->hscroll ^ dx) >> 3) & 1;
     cell -= adj + 1;
     ts->cells -= adj;
-    RamSVid[0x3e] = RamSVid[0x3f] = plane_sh >> 16;
+    RamSVid[0x3e] = RamSVid[0x3f] = BURN_ENDIAN_SWAP_INT16(plane_sh >> 16);
   }
   cell+=cellskip;
   tilex+=cellskip;
@@ -4209,7 +4356,7 @@ static void DrawStripVSRam(struct MegadriveTileStrip *ts, INT32 plane_sh, INT32 
   if ((cell&1)==1)
   {
     INT32 line,vscroll;
-    vscroll = RamSVid[plane + (cell&0x3e)];
+    vscroll = BURN_ENDIAN_SWAP_INT16(RamSVid[plane + (cell&0x3e)]);
 
     // Find the line in the name table
     line=(vscroll+scan)&ts->line&0xffff; // ts->line is really ymask ..
@@ -4223,7 +4370,7 @@ static void DrawStripVSRam(struct MegadriveTileStrip *ts, INT32 plane_sh, INT32 
     if ((cell&1)==0)
     {
       INT32 line,vscroll;
-      vscroll = RamSVid[plane + (cell&0x3e)];
+      vscroll = BURN_ENDIAN_SWAP_INT16(RamSVid[plane + (cell&0x3e)]);
 
       // Find the line in the name table
       line=(vscroll+scan)&ts->line&0xffff; // ts->line is really ymask ..
@@ -4231,7 +4378,7 @@ static void DrawStripVSRam(struct MegadriveTileStrip *ts, INT32 plane_sh, INT32 
       ty=(line&7)<<1; // Y-Offset into tile
     }
 
-    code= RamVid[ts->nametab + nametabadd + (tilex & ts->xmask)];
+    code= BURN_ENDIAN_SWAP_INT16(RamVid[ts->nametab + nametabadd + (tilex & ts->xmask)]);
 //    code &= ~force; // forced always draw everything
     code |= ty<<16; // add ty since that can change pixel row for every 2nd tile
 
@@ -4247,7 +4394,7 @@ static void DrawStripVSRam(struct MegadriveTileStrip *ts, INT32 plane_sh, INT32 
     }
 
     pack = (code & 0x1000 ? ty^0xe : ty); // Y-flip
-    pack = *(unsigned int *)(RamVid + addr+pack);
+    pack = BURN_ENDIAN_SWAP_INT32(*(unsigned int *)(RamVid + addr+pack));
     if (!pack)
       blank = code;
 
@@ -4287,7 +4434,7 @@ static void DrawStripInterlace(struct MegadriveTileStrip *ts, INT32 plane_sh)
   {
     UINT32 pack;
 
-    code = RamVid[ts->nametab + (tilex & ts->xmask)];
+    code = BURN_ENDIAN_SWAP_INT16(RamVid[ts->nametab + (tilex & ts->xmask)]);
     if (code==blank) continue;
     if (code>>15) { // high priority tile
       INT32 cval = (code&0xfc00) | (dx<<16) | (ty<<25);
@@ -4307,7 +4454,7 @@ static void DrawStripInterlace(struct MegadriveTileStrip *ts, INT32 plane_sh)
       pal=((code>>9)&0x30) | sh;
     }
 
-    pack = *(UINT32 *)(RamVid + addr);
+    pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + addr));
     if (!pack) {
       blank = code;
       continue;
@@ -4360,11 +4507,11 @@ static void DrawLayer(INT32 plane_sh, UINT32 *hcache, INT32 cellskip, INT32 maxc
   htab+=plane_sh&LF_PLANE; // A or B
 
   // Get horizontal scroll value, will be masked later
-  ts.hscroll = RamVid[htab & 0x7fff];
+  ts.hscroll = BURN_ENDIAN_SWAP_INT16(RamVid[htab & 0x7fff]);
 
   if((RamVReg->reg[12]&6) == 6) {
     // interlace mode 2
-    vscroll = RamSVid[plane_sh & 1]; // Get vertical scroll value
+    vscroll = BURN_ENDIAN_SWAP_INT16(RamSVid[plane_sh & 1]); // Get vertical scroll value
 
     // Find the line in the name table
     ts.line=(vscroll+(Scanline<<1)+RamVReg->field)&((ymask<<1)|1);
@@ -4377,7 +4524,7 @@ static void DrawLayer(INT32 plane_sh, UINT32 *hcache, INT32 cellskip, INT32 maxc
     ts.line=ymask|(shift[width]<<24); // save some stuff instead of line
     if (nBurnLayer & 2) DrawStripVSRam(&ts, plane_sh, cellskip);
   } else {
-    vscroll = RamSVid[plane_sh & 1]; // Get vertical scroll value
+    vscroll = BURN_ENDIAN_SWAP_INT16(RamSVid[plane_sh & 1]); // Get vertical scroll value
 
     // Find the line in the name table
     ts.line=(vscroll+Scanline)&ymask;
@@ -4416,7 +4563,7 @@ static void DrawWindow(INT32 tstart, INT32 tend, INT32 prio, INT32 sh)
   if (prio && !(RamVReg->rendstatus & PDRAW_WND_DIFF_PRIO)) {
 	  return; // derptest
     // check the first tile code
-    code = RamVid[nametab + tilex];
+    code = BURN_ENDIAN_SWAP_INT16(RamVid[nametab + tilex]);
     // if the whole window uses same priority (what is often the case), we may be able to skip this field
     if ((code>>15) != prio) return;
   }
@@ -4433,7 +4580,7 @@ static void DrawWindow(INT32 tstart, INT32 tend, INT32 prio, INT32 sh)
       INT32 dx, addr;
       INT32 pal;
 
-      code = RamVid[nametab + tilex];
+      code = BURN_ENDIAN_SWAP_INT16(RamVid[nametab + tilex]);
 //      if (code==blank) continue;
       if ((code>>15) != prio) {
         RamVReg->rendstatus |= PDRAW_WND_DIFF_PRIO;
@@ -4444,7 +4591,7 @@ static void DrawWindow(INT32 tstart, INT32 tend, INT32 prio, INT32 sh)
       addr=(code&0x7ff)<<4;
       if (code&0x1000) addr+=14-ty; else addr+=ty; // Y-flip
 
-      pack = *(UINT32 *)(RamVid + addr);
+      pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + addr));
       if (!pack) {
         blank = code;
         continue;
@@ -4465,7 +4612,7 @@ static void DrawWindow(INT32 tstart, INT32 tend, INT32 prio, INT32 sh)
       INT32 dx, addr;
       INT32 pal;
 
-      code = RamVid[nametab + tilex];
+      code = BURN_ENDIAN_SWAP_INT16(RamVid[nametab + tilex]);
 //      if(code==blank) continue;
       if((code>>15) != prio) {
         RamVReg->rendstatus |= PDRAW_WND_DIFF_PRIO;
@@ -4486,7 +4633,7 @@ static void DrawWindow(INT32 tstart, INT32 tend, INT32 prio, INT32 sh)
       addr=(code&0x7ff)<<4;
       if (code&0x1000) addr+=14-ty; else addr+=ty; // Y-flip
 
-      pack = *(UINT32 *)(RamVid + addr);
+      pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + addr));
       if (!pack) {
         blank = code;
         continue;
@@ -4544,7 +4691,7 @@ static void DrawTilesFromCache(UINT32 *hc, INT32 sh, INT32 rlim)
       addr = (code & 0x7ff) << 4;
       addr += code >> 25; // y offset into tile
 
-      pack = *(UINT32 *)(RamVid + addr);
+      pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + addr));
       if (!pack) {
         blank = (INT16)code;
         continue;
@@ -4573,7 +4720,7 @@ static void DrawTilesFromCache(UINT32 *hc, INT32 sh, INT32 rlim)
       *zb++ &= 0xbf; *zb++ &= 0xbf; *zb++ &= 0xbf; *zb++ &= 0xbf;
       *zb++ &= 0xbf; *zb++ &= 0xbf; *zb++ &= 0xbf; *zb++ &= 0xbf;
 
-      pack = *(UINT32 *)(RamVid + addr);
+      pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + addr));
       if (!pack)
         continue;
 
@@ -4676,7 +4823,7 @@ static void DrawSprite(INT32 *sprite, INT32 sh)
     if(sx<=0)   continue;
     if(sx>=328) break; // Offscreen
 
-    pack = *(UINT32 *)(RamVid + (tile & 0x7fff));
+    pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + (tile & 0x7fff)));
     fTileFunc(pd + sx, pack, pal);
   }
 }
@@ -4696,7 +4843,7 @@ static void DrawTilesFromCacheForced(const UINT32 *hc)
 
     dx = (code >> 16) & 0x1ff;
     pal = ((code >> 9) & 0x30);
-    pack = *(UINT32 *)(RamVid + addr);
+    pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + addr));
 
     if (code & 0x0800) TileFlip_and(pd + dx, pack, pal);
     else               TileNorm_and(pd + dx, pack, pal);
@@ -4717,7 +4864,7 @@ static void DrawSpriteInterlace(UINT32 *sprite)
 	if (~nSpriteEnable & 0x02) return;
 
 	// parse the sprite data
-	sy=sprite[0];
+	sy=BURN_ENDIAN_SWAP_INT32(sprite[0]);
 	height=sy>>24;
 	sy=(sy&0x3ff)-0x100; // Y
 	width=(height>>2)&3; height&=3;
@@ -4725,7 +4872,7 @@ static void DrawSpriteInterlace(UINT32 *sprite)
 
 	row=((Scanline<<1)+RamVReg->field)-sy; // Row of the sprite we are on
 
-	code=sprite[1];
+	code=BURN_ENDIAN_SWAP_INT32(sprite[1]);
 	sx=((code>>16)&0x1ff)-0x78; // X
 
 	if (code&0x1000) row^=(8<<height)-1; // Flip Y
@@ -4747,7 +4894,7 @@ static void DrawSpriteInterlace(UINT32 *sprite)
 		if(sx<=0)   continue;
 		if(sx>=328) break; // Offscreen
 
-		pack = *(UINT32 *)(RamVid + (tile & 0x7fff));
+		pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + (tile & 0x7fff)));
 		if (code & 0x0800) TileFlip(pd + sx, pack, pal);
 		else               TileNorm(pd + sx, pack, pal);
 	}
@@ -4770,8 +4917,8 @@ static void DrawAllSpritesInterlace(INT32 pri, INT32 sh)
 		sprite=(UINT32 *)(RamVid+((table+(link<<2))&0x7ffc)); // Find sprite
 
 		// get sprite info
-		code = sprite[0];
-		sx = sprite[1];
+		code = BURN_ENDIAN_SWAP_INT32(sprite[0]);
+		sx = BURN_ENDIAN_SWAP_INT32(sprite[1]);
 		if(((sx>>15)&1) != pri) goto nextsprite; // wrong priority sprite
 
 		// check if it is on this line
@@ -4872,7 +5019,7 @@ static void DrawSpritesSHi(UINT8 *sprited)
       if(sx<=0)   continue;
       if(sx>=328) break; // Offscreen
 
-      pack = *(UINT32 *)(RamVid + (tile & 0x7fff));
+      pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + (tile & 0x7fff)));
       fTileFunc(pd + sx, pack, pal);
     }
   }
@@ -4952,7 +5099,7 @@ static void DrawSpritesHiAS(UINT8 *sprited, INT32 sh)
       if(sx<=0)   continue;
       if(sx>=328) break; // Offscreen
 
-      pack = *(UINT32 *)(RamVid + (tile & 0x7fff));
+      pack = BURN_ENDIAN_SWAP_INT32(*(UINT32 *)(RamVid + (tile & 0x7fff)));
       fTileFunc(pd + sx, mb + sx, pack, pal);
     }
   }
@@ -4997,7 +5144,7 @@ static void PrepareSprites(INT32 full)
       sprite=(UINT32 *)(RamVid+((table+(link<<2))&0x7ffc)); // Find sprite
 
       // parse sprite info
-      code2 = sprite[1];
+      code2 = BURN_ENDIAN_SWAP_INT32(sprite[1]);
       sx = (code2>>16)&0x1ff;
       sx -= 0x78; // Get X coordinate + 8
       sy = (pack << 16) >> 16;
@@ -5033,7 +5180,7 @@ found:;
       pd[1] = code2;
 
       // Find next sprite
-      link=(sprite[0]>>16)&0x7f;
+      link=(BURN_ENDIAN_SWAP_INT32(sprite[0])>>16)&0x7f;
       if (!link) break; // End of sprites
     }
   }
@@ -5050,13 +5197,13 @@ found:;
       sprite=(UINT32 *)(RamVid+((table+(link<<2))&0x7ffc)); // Find sprite
 
       // parse sprite info
-      code = sprite[0];
+      code = BURN_ENDIAN_SWAP_INT32(sprite[0]);
       sy = (code&0x1ff)-0x80;
       hv = (code>>24)&0xf;
       height = (hv&3)+1;
 
       width  = (hv>>2)+1;
-      code2 = sprite[1];
+      code2 = BURN_ENDIAN_SWAP_INT32(sprite[1]);
       sx = (code2>>16)&0x1ff;
       sx -= 0x78; // Get X coordinate + 8
 
@@ -5520,6 +5667,10 @@ INT32 MegadriveFrame()
 	SekCyclesNewFrame(); // for sound sync
 	ZetNewFrame();
 
+	if (SegaCDMode) {
+		SegaCDNewFrame();
+	}
+
 	SekOpen(0);
 	ZetOpen(0);
 
@@ -5666,6 +5817,8 @@ INT32 MegadriveFrame()
 		}
 
 		// decide if we draw this line
+		INT32 vsram_late = vsram_late_count;
+		if (vsram_late) VSRAMLateSwap();
 		if ((!(RamVReg->reg[1]&8) && y<=224) || ((RamVReg->reg[1]&8) && y<240)) {
 			if (interlacemode2) {
 				RamVReg->field = 0;
@@ -5677,6 +5830,10 @@ INT32 MegadriveFrame()
 			} else {
 				PicoLine(y);
 			}
+		}
+		if (vsram_late) {
+			VSRAMLateSwap();
+			vsram_late_count = 0;
 		}
 
 		z80CyclesSync();
@@ -5710,6 +5867,10 @@ INT32 MegadriveFrame()
 #endif
 	}
 
+	if (SegaCDMode) {
+		SegaCDEndFrame(SekCyclesDoneFrame());
+	}
+
 	if (pBurnDraw) MegadriveDraw();
 
 	if (pBurnSoundOut) {
@@ -5725,6 +5886,14 @@ INT32 MegadriveFrame()
 
 	if (sot4wmode && pBurnSoundOut) {
 		vx_render(pBurnSoundOut, nBurnSoundLen);
+	}
+
+	if (SegaCDMode) {
+		SegaCDSoundUpdate(pBurnSoundOut, nBurnSoundLen);
+	}
+
+	if (megasdmode) {
+		megasd_sound_update(pBurnSoundOut, nBurnSoundLen);
 	}
 
 	SekClose();
@@ -5796,9 +5965,17 @@ INT32 MegadriveScan(INT32 nAction, INT32 *pnMin)
 		i2c_scan(nAction, pnMin);
 	}
 
-	if (psolarmode) // pier solar
+	if (psolarmode || SegaCDCart == 2) // pier solar
 	{
 		md_eeprom_stm95_scan(nAction);
+	}
+
+	if (SegaCDMode) {
+		SegaCDScan(nAction, pnMin);
+	}
+
+	if (megasdmode) {
+		megasd_scan(nAction, pnMin);
 	}
 
 	if (nAction & ACB_WRITE && (BurnDrvGetHardwareCode() & 0xff) == HARDWARE_SEGA_MEGADRIVE_PCB_SSF2) {

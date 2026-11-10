@@ -410,7 +410,7 @@ inline static void WriteWordROM(UINT32 a, UINT16 d)
 	#endif
 	pr = FIND_R(a);
 	if ((uintptr_t)pr >= SEK_MAXHANDLER) {
-		*((UINT16*)(pr + (a & SEK_PAGEM))) = (UINT16)d;
+		*((UINT16*)(pr + (a & SEK_PAGEM))) = (UINT16)BURN_ENDIAN_SWAP_INT16(d);
 		return;
 	}
 	pSekExt->WriteWord[(uintptr_t)pr](a, d);
@@ -536,7 +536,7 @@ inline static void WriteLongROM(UINT32 a, UINT32 d)
 	pr = FIND_R(a);
 	if ((uintptr_t)pr >= SEK_MAXHANDLER) {
 		d = (d >> 16) | (d << 16);
-		*((UINT32*)(pr + (a & SEK_PAGEM))) = d;
+		*((UINT32*)(pr + (a & SEK_PAGEM))) = BURN_ENDIAN_SWAP_INT32(d);
 		return;
 	}
 	pSekExt->WriteLong[(uintptr_t)pr](a, d);
@@ -2481,8 +2481,6 @@ bool SekDbgSetRegister(SekRegister nRegister, UINT32 nValue)
 		case SEK_REG_D5:
 		case SEK_REG_D6:
 		case SEK_REG_D7:
-			break;
-
 		case SEK_REG_A0:
 		case SEK_REG_A1:
 		case SEK_REG_A2:
@@ -2491,7 +2489,13 @@ bool SekDbgSetRegister(SekRegister nRegister, UINT32 nValue)
 		case SEK_REG_A5:
 		case SEK_REG_A6:
 		case SEK_REG_A7:
+			if (nSekCPUType[nSekActive] == 0) break;
+#ifdef EMU_M68K
+			m68k_set_reg((m68k_register_t)(M68K_REG_D0 + (nRegister - SEK_REG_D0)), nValue);
+			return true;
+#else
 			break;
+#endif
 
 		case SEK_REG_PC:
 			if (nSekCPUType[nSekActive] == 0) {
@@ -2502,11 +2506,16 @@ bool SekDbgSetRegister(SekRegister nRegister, UINT32 nValue)
 			} else {
 				m68k_set_reg(M68K_REG_PC, nValue);
 			}
-			SekClose();
 			return true;
 
 		case SEK_REG_SR:
+			if (nSekCPUType[nSekActive] == 0) break;
+#ifdef EMU_M68K
+			m68k_set_reg(M68K_REG_SR, nValue);
+			return true;
+#else
 			break;
+#endif
 
 		case SEK_REG_SP:
 		case SEK_REG_USP:

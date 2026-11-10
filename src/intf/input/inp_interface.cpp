@@ -6,6 +6,7 @@
 #endif
 
 UINT32 nInputSelect = 0;
+bool bInputRumble = true; // enabled via interface (user-option)
 bool bInputOkay = false;
 INT32 nInputIntfMouseDivider = 1;
 
@@ -13,8 +14,11 @@ static bool bCinpOkay;
 
 #if defined (BUILD_WIN32)
 	extern struct InputInOut InputInOutDInput;
+	extern struct InputInOut InputInOutXInput;
 #elif defined (BUILD_MACOS)
 	extern struct InputInOut InputInOutMacOS;
+#elif defined (BUILD_HEADLESS)
+	extern struct InputInOut InputInOutHeadless;
 #elif defined (BUILD_SDL)
 	extern struct InputInOut InputInOutSDL;
 #elif defined (BUILD_SDL2)
@@ -29,8 +33,11 @@ static struct InputInOut *pInputInOut[]=
 {
 #if defined (BUILD_WIN32)
 	&InputInOutDInput,
+	&InputInOutXInput,
 #elif defined (BUILD_MACOS)
 	&InputInOutMacOS,
+#elif defined (BUILD_HEADLESS)
+	&InputInOutHeadless,
 #elif defined (BUILD_SDL2)
 		&InputInOutSDL2,
 #elif defined (BUILD_SDL)
@@ -160,12 +167,14 @@ INT32 InputInit()
 	bInputOkay = false;
 
 	if (nInputSelect >= INPUT_LEN) {
-		return 1;
+		nInputSelect = 0;		// e.g. invalid value from the config file
 	}
 
 	if ((nRet = pInputInOut[nInputSelect]->Init()) == 0) {
 		bInputOkay = true;
 	}
+
+	BurnExtRumbleCallback = InputSetRumble;
 
 	return nRet;
 }
@@ -178,9 +187,139 @@ INT32 InputExit()
 		return 1;
 	}
 
+	InputStopRumble();
+	BurnExtRumbleCallback = NULL;
+
 	bInputOkay = false;
 
 	return pInputInOut[nInputSelect]->Exit();
+}
+
+// Select an input plugin, re-initialising input if it was active
+INT32 InputSelect(UINT32 nPlugIn)
+{
+	if (nPlugIn >= INPUT_LEN) {
+		return 1;
+	}
+
+	if (nPlugIn == nInputSelect) {
+		return 0;
+	}
+
+	bool bWasOkay = bInputOkay;
+
+	if (bWasOkay) {
+		InputExit();
+	}
+
+	nInputSelect = nPlugIn;
+
+	if (bWasOkay) {
+		return InputInit();
+	}
+
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Rumble
+
+// Which player (1-based) an input belongs to, 0 if none.
+// nIdent only carries the player when szInfo is "pN ..."; inputs like "mouse x-axis"
+// (light guns, trackballs, ...) only have it in the name ("P1 Gun X"), so check that too.
+static UINT32 InputGetPlayer(struct GameInp* pgi, UINT32 i)
+{
+	UINT32 nPlayer = (pgi->nIdent >> 28) & 0x0f;
+
+	if (nPlayer == 0) {
+		struct BurnInputInfo bii;
+		memset(&bii, 0, sizeof(bii));
+
+		if (BurnDrvGetInputInfo(&bii, i) == 0 && bii.szName && bii.szName[0] == 'P' && bii.szName[1] >= '1' && bii.szName[1] <= '8') {
+			nPlayer = bii.szName[1] - '0';
+		}
+	}
+
+	return nPlayer;
+}
+
+// Find which joystick a player (0-based) is using, from the current input mapping.
+// Coin / start inputs are ignored. Returns -1 if the player isn't on a joystick.
+static INT32 InputPlayerToJoy(INT32 nPlayer)
+{
+	struct GameInp* pgi;
+	UINT32 i;
+
+	if (GameInp == NULL || nPlayer < 0 || nPlayer > 7) {
+		return -1;
+	}
+
+	for (i = 0, pgi = GameInp; i < nGameInpCount; i++, pgi++) {
+		switch (pgi->nInput) {							// only input types that can be on a joystick
+			case GIT_SWITCH:
+			case GIT_JOYSLIDER:
+			case GIT_JOYAXIS_FULL:
+			case GIT_JOYAXIS_NEG:
+			case GIT_JOYAXIS_POS:
+				break;
+			default:
+				continue;
+		}
+		if (pgi->nIdent & (GK_COIN | GK_START)) {
+			continue;
+		}
+		if (InputGetPlayer(pgi, i) != (UINT32)(nPlayer + 1)) {
+			continue;
+		}
+
+		switch (pgi->nInput) {
+			case GIT_SWITCH:
+				if ((pgi->Input.Switch.nCode & 0xC000) == 0x4000) {
+					return (pgi->Input.Switch.nCode >> 8) & 0x3F;
+				}
+				break;
+			case GIT_JOYSLIDER:
+				return pgi->Input.Slider.JoyAxis.nJoy;
+			case GIT_JOYAXIS_FULL:
+			case GIT_JOYAXIS_NEG:
+			case GIT_JOYAXIS_POS:
+				return pgi->Input.JoyAxis.nJoy;
+		}
+	}
+
+	return -1;
+}
+
+// Called by drivers through BurnRumble() / BurnExtRumbleCallback
+INT32 InputSetRumble(INT32 nPlayer, INT32 nStrong, INT32 nWeak)
+{
+	if (!bInputOkay || nInputSelect >= INPUT_LEN || pInputInOut[nInputSelect]->SetRumble == NULL) {
+		return 1;
+	}
+
+	if (nPlayer < 0) {									// all players
+		return pInputInOut[nInputSelect]->SetRumble(-1, 0, 0);
+	}
+
+	if (!bInputRumble) {
+		nStrong = nWeak = 0;
+	}
+
+	INT32 nJoy = InputPlayerToJoy(nPlayer);
+	if (nJoy < 0) {
+		return 1;
+	}
+
+	return pInputInOut[nInputSelect]->SetRumble(nJoy, nStrong, nWeak);
+}
+
+void InputStopRumble()
+{
+	if (!bInputOkay || nInputSelect >= INPUT_LEN || pInputInOut[nInputSelect]->SetRumble == NULL) {
+		return;
+	}
+
+	pInputInOut[nInputSelect]->SetRumble(-1, 0, 0);
 }
 
 // This will request exclusive access for mouse and/or request input processing if the application is in the foreground only

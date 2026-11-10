@@ -139,6 +139,7 @@ HTREEITEM hFilterGba				= NULL;
 HTREEITEM hFilterNgp				= NULL;
 HTREEITEM hFilterChannelF			= NULL;
 HTREEITEM hFilterAstroHome			= NULL;
+HTREEITEM hFilterAtari2600			= NULL;
 HTREEITEM hFilterSms				= NULL;
 HTREEITEM hFilterGg					= NULL;
 HTREEITEM hFilterSg1000				= NULL;
@@ -299,8 +300,10 @@ static UINT64 ChannelFValue			= (UINT64)HARDWARE_PREFIX_CHANNELF >> 24;
 static UINT64 MASKCHANNELF			= (UINT64)1 << ChannelFValue;
 static UINT64 AstroHValue			= (UINT64)HARDWARE_ASTROHOME >> 24;
 static UINT64 MASKASTROHOME			= (UINT64)1 << AstroHValue;
+static UINT64 Atari2600Value			= (UINT64)HARDWARE_ATARI2600 >> 24;
+static UINT64 MASKATARI2600			= (UINT64)1 << Atari2600Value;
 
-static UINT64 MASKALL				= ((UINT64)MASKCAPMISC | MASKCAVE | MASKCPS | MASKCPS2 | MASKCPS3 | MASKDATAEAST | MASKGALAXIAN | MASKIREM | MASKKANEKO | MASKKONAMI | MASKNEOGEO | MASKPACMAN | MASKPGM | MASKPGM2 | MASKPSIKYO | MASKSEGA | MASKSETA | MASKTAITO | MASKTECHNOS | MASKTOAPLAN | MASKMISCPRE90S | MASKMISCPOST90S | MASKMEGADRIVE | MASKPCENGINE | MASKSMS | MASKGG | MASKSG1000 | MASKCOLECO | MASKMSX | MASKSPECTRUM | MASKMIDWAY | MASKNES | MASKFDS | MASKSNES | MASKNGP | MASKCHANNELF | MASKASTROHOME | MASKGBA );
+static UINT64 MASKALL				= ((UINT64)MASKCAPMISC | MASKCAVE | MASKCPS | MASKCPS2 | MASKCPS3 | MASKDATAEAST | MASKGALAXIAN | MASKIREM | MASKKANEKO | MASKKONAMI | MASKNEOGEO | MASKPACMAN | MASKPGM | MASKPGM2 | MASKPSIKYO | MASKSEGA | MASKSETA | MASKTAITO | MASKTECHNOS | MASKTOAPLAN | MASKMISCPRE90S | MASKMISCPOST90S | MASKMEGADRIVE | MASKPCENGINE | MASKSMS | MASKGG | MASKSG1000 | MASKCOLECO | MASKMSX | MASKSPECTRUM | MASKMIDWAY | MASKNES | MASKFDS | MASKSNES | MASKNGP | MASKCHANNELF | MASKASTROHOME | MASKGBA | MASKATARI2600 );
 
 #define SEARCHSUBDIRS			(1 << 26)
 #define UNAVAILABLE				(1 << 27)
@@ -1451,6 +1454,10 @@ static void RebuildEverything()
 	SendMessage(hSelList, WM_SETREDRAW, (WPARAM)FALSE,(LPARAM)TVI_ROOT);	// disable redraw
 	SendMessage(hSelList, TVM_DELETEITEM, 0, (LPARAM)TVI_ROOT);				// Destory all nodes
 	SelListMake();
+
+	HTREEITEM hTvRoot = TreeView_GetRoot(hSelList); // start @ the top of the list! -dink
+	if (hTvRoot) TreeView_SelectSetFirstVisible(hSelList, hTvRoot);
+
 	SendMessage(hSelList, WM_SETREDRAW, (WPARAM)TRUE, (LPARAM)TVI_ROOT);	// enable redraw
 
 	// Clear the things in our Info-box
@@ -1637,6 +1644,7 @@ static void CreateFilters()
 	_TVCreateFiltersA(hHardware		, IDS_SEL_NGP			, hFilterNgp			, nLoadMenuShowX & MASKNGP							);
 	_TVCreateFiltersA(hHardware		, IDS_SEL_CHANNELF		, hFilterChannelF		, nLoadMenuShowX & MASKCHANNELF						);
 	_TVCreateFiltersA(hHardware		, IDS_SEL_ASTROHOME		, hFilterAstroHome		, nLoadMenuShowX & MASKASTROHOME					);
+	_TVCreateFiltersA(hHardware		, IDS_SEL_ATARI2600		, hFilterAtari2600		, nLoadMenuShowX & MASKATARI2600					);
 	_TVCreateFiltersA(hHardware		, IDS_SEL_MISCPRE90S	, hFilterMiscPre90s		, nLoadMenuShowX & MASKMISCPRE90S					);
 	_TVCreateFiltersA(hHardware		, IDS_SEL_MISCPOST90S	, hFilterMiscPost90s	, nLoadMenuShowX & MASKMISCPOST90S					);
 
@@ -1671,6 +1679,7 @@ enum {
 	ICON_NGP,
 	ICON_CHANNELF,
 	ICON_ASTROHOME,
+	ICON_ATARI2600,
 	ICON_ENUMEND	// arcade
 };
 
@@ -1870,6 +1879,7 @@ static UINT32 __stdcall CacheDrvIconsProc(void* lpParam)
 				_T("icon_ngp"),
 				_T("icon_chf"),
 				_T("icon_astro"),
+				_T("icon_a2600"),
 				_T("icon_arc")
 			};
 
@@ -2052,7 +2062,7 @@ void LoadDrvIcons()
 
 		// By hardwares
 		if (bIconsByHardwares) {
-			if ((nCode & HARDWARE_PUBLIC_MASK) == HARDWARE_SEGA_MEGADRIVE) {
+			if ((nCode & HARDWARE_PUBLIC_MASK) == HARDWARE_SEGA_MEGADRIVE || (nCode & HARDWARE_PUBLIC_MASK) == HARDWARE_SEGA_MEGACD) {
 				hDrvIcon[nDrvIndex] = pIconsCache[nDrvCount + ICON_MEGADRIVE];	continue;
 			}
 			else
@@ -2121,6 +2131,10 @@ void LoadDrvIcons()
 			else
 			if ((nCode & HARDWARE_PUBLIC_MASK) == HARDWARE_ASTROHOME) {
 				hDrvIcon[nDrvIndex] = pIconsCache[nDrvCount + ICON_ASTROHOME];	continue;
+			}
+			else
+			if ((nCode & HARDWARE_PUBLIC_MASK) == HARDWARE_ATARI2600) {
+				hDrvIcon[nDrvIndex] = pIconsCache[nDrvCount + ICON_ATARI2600];	continue;
 			}
 			else {
 				hDrvIcon[nDrvIndex] = pIconsCache[nDrvCount + ICON_ENUMEND];	continue;
@@ -2319,6 +2333,7 @@ static INT_PTR CALLBACK DialogProc(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lP
 				_TreeView_SetCheckState(hFilterList, hFilterNgp, FALSE);
 				_TreeView_SetCheckState(hFilterList, hFilterChannelF, FALSE);
 				_TreeView_SetCheckState(hFilterList, hFilterAstroHome, FALSE);
+				_TreeView_SetCheckState(hFilterList, hFilterAtari2600, FALSE);
 				_TreeView_SetCheckState(hFilterList, hFilterMidway, FALSE);
 
 				nLoadMenuShowX |= MASKALL;
@@ -2364,6 +2379,7 @@ static INT_PTR CALLBACK DialogProc(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lP
 				_TreeView_SetCheckState(hFilterList, hFilterNgp, TRUE);
 				_TreeView_SetCheckState(hFilterList, hFilterChannelF, TRUE);
 				_TreeView_SetCheckState(hFilterList, hFilterAstroHome, TRUE);
+				_TreeView_SetCheckState(hFilterList, hFilterAtari2600, TRUE);
 				_TreeView_SetCheckState(hFilterList, hFilterMidway, TRUE);
 
 				nLoadMenuShowX &= ~MASKALL; //0xf8000000; make this dynamic for future hardware additions -dink
@@ -2615,6 +2631,7 @@ static INT_PTR CALLBACK DialogProc(HWND hDlg, UINT Msg, WPARAM wParam, LPARAM lP
 		if (hItemChanged == hFilterNgp)				_ToggleGameListing(nLoadMenuShowX, MASKNGP);
 		if (hItemChanged == hFilterChannelF)		_ToggleGameListing(nLoadMenuShowX, MASKCHANNELF);
 		if (hItemChanged == hFilterAstroHome)		_ToggleGameListing(nLoadMenuShowX, MASKASTROHOME);
+		if (hItemChanged == hFilterAtari2600)		_ToggleGameListing(nLoadMenuShowX, MASKATARI2600);
 		if (hItemChanged == hFilterMidway)			_ToggleGameListing(nLoadMenuShowX, MASKMIDWAY);
 
 		if (hItemChanged == hFilterBootleg)			_ToggleGameListing(nLoadMenuBoardTypeFilter, BDF_BOOTLEG);

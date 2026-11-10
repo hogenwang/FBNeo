@@ -36,6 +36,7 @@ INT32 MegadriveInitPaprium();
 INT32 MegadriveInitPsolar();
 INT32 MegadriveInitSot4w();
 INT32 MegadriveInitColocodx();
+INT32 MegadriveInitSegaCD();
 
 INT32 MegadriveExit();
 INT32 MegadriveFrame();
@@ -47,6 +48,8 @@ void MegadriveLightGunOffsets(INT32 x, INT32 y, bool reticle = true);
 // pier solar
 void md_eeprom_stm95_reset();
 void md_eeprom_stm95_init(UINT8 *rom);
+void md_eeprom_stm95_init_scd(UINT8 *rom);
+void md_eeprom_stm95_map_banks();
 void md_eeprom_stm95_scan(INT32 nAction);
 UINT16 md_psolar_rw(UINT32 offset);
 
