@@ -391,6 +391,9 @@ struct BurnArtworkLayers {
 	UINT32 *pUnder, *pAdd, *pMul;				// 0xffRRGGBB
 	INT32 nScreenX, nScreenY, nScreenW, nScreenH;	// where the game image goes, in the layers
 	INT32 nSerial;								// changes when the layers do (re-upload them)
+	INT32 nSerialUnder, nSerialOver;			// the nSerial pUnder / pAdd + pMul last changed at
+	INT32 nDirtyX, nDirtyY, nDirtyW, nDirtyH;	// what changed from nSerial - 1 to nSerial (if the frontend has
+												// nSerial - 1, it only needs to upload that, of the layers that changed)
 };
 extern INT32 bBurnArtworkLayered;				// allow it (1), or always use the core's compositing (0)
 INT32 BurnArtworkSetLayered(INT32 bLayered);	// call before getting the image size; returns 1 if layered artwork is active
@@ -865,7 +868,8 @@ int BurnComputeSHA1(const UINT8 *buffer, int buffer_size, char *hash_str);
 #define HARDWARE_SEGA_MEGADRIVE_PCB_POKEMON2			(41)
 #define HARDWARE_SEGA_MEGADRIVE_PCB_MULAN				(42)
 #define HARDWARE_SEGA_MEGADRIVE_PCB_16ZHANG             (43)
-#define HARDWARE_SEGA_MEGADRIVE_PCB_CHAOJIMJ            (44) // we can have 64 (0-63) of these
+#define HARDWARE_SEGA_MEGADRIVE_PCB_CHAOJIMJ            (44)
+#define HARDWARE_SEGA_MEGADRIVE_PCB_SVP                 (45) // we can have 64 (0-63) of these
 
 #define HARDWARE_SEGA_MEGADRIVE_LIGHTGUN_MENACER        (0x0100)
 #define HARDWARE_SEGA_MEGADRIVE_LIGHTGUN_JUSTIFIER      (0x0200)

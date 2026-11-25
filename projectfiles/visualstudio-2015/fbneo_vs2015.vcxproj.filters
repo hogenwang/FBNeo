@@ -1072,6 +1072,9 @@
     <ClCompile Include="..\..\src\burn\drv\sega\d_xbrd.cpp">
       <Filter>burn\drv\sega</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\burn\drv\sega\d_y2.cpp">
+      <Filter>burn\drv\sega</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\burn\drv\sega\d_ybrd.cpp">
       <Filter>burn\drv\sega</Filter>
     </ClCompile>
@@ -2839,6 +2842,9 @@
     <ClCompile Include="..\..\src\burn\snd\ymz770.cpp">
       <Filter>burn\snd</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\burn\snd\rpp324.cpp">
+      <Filter>burn\snd</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\burn\burn_bitmap.cpp">
       <Filter>burn</Filter>
     </ClCompile>
@@ -3287,9 +3293,6 @@
       <Filter>burn\drv\midway</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\burn\drv\midway\williams_adpcm.cpp">
-      <Filter>burn\drv\midway</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\src\burn\drv\midway\williams_cvsd.cpp">
       <Filter>burn\drv\midway</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\burn\drv\midway\yawdim_sound.cpp">

@@ -1,29 +1,7 @@
 // FB Neo Midway 8080 B&W / Taito 8080 (Space Invaders and friends) driver module
-// Based on MAME drivers 8080bw.cpp / mw8080bw.cpp by Michael Strutts, Nicola Salmoria,
-// Tormod Tjaberg, Mirko Buffoni, Lee Taylor, Valerio Verrando, Marco Cassili,
-// Zsolt Vasvari, Aaron Giles, Derrick Renaud, Jonathan Gevaryahu, hap, Robbbert and others
-//
-// Sound:
-//   - the analog (MAME "discrete") boards are emulated in C below: Space Invaders
-//     (Midway/Taito sound board, also Space Invaders II cocktail), Polaris, Space Chaser,
-//     Boot Hill, the Taito music generator of Balloon Bomber / Indian Battle / Lupin III
-//     and the Midway tone generator (music) of Clowns, Space Walk, Dog Patch,
-//     Desert Gun and Double Play / Extra Inning.
-//   - Gun Fight and 280-ZZZAP / Laguna Racer: C versions of MAME's netlists.
-//   - the games MAME plays with the "invaders" samples (Space Invaders Part II and
-//     the other Taito boards, Balloon Bomber, Indian Battle, Yosaku to Donbei,
-//     Shuttle Invader, Darth Vader, Rolling Crash, ...) use the generated Space
-//     Invaders sound board instead: each sample number drives the matching circuit.
-//   - games that only ever had samples in MAME still use samples (+ the SN76477 for
-//     the UFO / helicopter etc.)
-//   - no sound (yet): Amazing Maze, Checkmate, Tornado Baseball, Shuffleboard,
-//     Bowling Alley, Blue Shark, Space Encounters; the non-music effects of
-//     Clowns, Space Walk, Dog Patch, Desert Gun and Double Play.
-//
-// Color overlays (MAME layouts) are built-in and can be turned off with the
-// "Color Overlay" dip.  An external MAME artwork pack replaces them.
-//
-// Not (yet) ported from MAME's midw8080 directory: invmulti, sflush, rotaryf
+// Based on MAME driver by Michael Strutts, Nicola Salmoria, Tormod Tjaberg,
+// Mirko Buffoni, Lee Taylor, Valerio Verrando, Marco Cassili, Zsolt Vasvari,
+// Aaron Giles, Derrick Renaud, Jonathan Gevaryahu, hap, Robbbert and others
 
 #include "tiles_generic.h"
 #include "z80_intf.h"
@@ -38,7 +16,6 @@
 #include "bitswap.h"
 #include <math.h>
 
-extern int ActiveZ80GetIFF1();
 void SN76477_sound_update_INT(INT32 param, INT16 *buffer, INT32 length);
 
 static UINT8 *AllMem;
@@ -79,7 +56,9 @@ static UINT8 port_2_last;
 static UINT8 port_3_last;
 static UINT8 soundlatch;
 static UINT8 sound_mute;
-static double sound_mute_vol;	// soft mute: ramps 1.0 <-> 0.0 instead of cutting the sound
+static double sound_mute_vol;	// soft mute
+static INT32 draw_xoffs;	// columns cropped from the left of the 260 pixel line (spcenctr)
+static INT32 light_add_r, light_add_g, light_add_b;	// lamp / strobe reflection on the screen (spcenctr)
 static INT32 vblank;
 static INT32 lupin3_step;
 static INT32 darthvdr_fleet_step;
@@ -99,8 +78,8 @@ static UINT8 DrvJoy1[8];
 static UINT8 DrvJoy2[8];
 static UINT8 DrvJoy3[8];
 static UINT8 DrvJoy4[8];
-static UINT8 DrvJoyP1[8];		// "control port" P1 (fire, left, right)
-static UINT8 DrvJoyP2[8];		// "control port" P2
+static UINT8 DrvJoyP1[8];		// P1 (fire, left, right)
+static UINT8 DrvJoyP2[8];		// P2
 static UINT8 DrvDips[5];
 static UINT8 DrvInputs[4];
 
@@ -161,6 +140,7 @@ enum {
 	SND_LAGUNAR,	// C version of the netlist
 	SND_BOOTHILL,	// discrete (stereo)
 	SND_MWMUSIC,	// midway tone generator only (+ samples)
+	SND_SPCENCTR,	// discrete + SN76477
 };
 
 struct mw_config {
@@ -178,26 +158,19 @@ struct mw_config {
 
 static const mw_config *cfg;
 
-// overlays (from MAME layouts, blend multiply)
+// overlays
 struct ovl_rect { float x0, y0, x1, y1, r, g, b; };
 struct ovl_layout { const ovl_rect *rects; INT32 count; float w, h; INT32 rot; };	// rot: 0 = ROT0, 1 = ROT270 (vertical), 2 = ROT90
 static const ovl_layout *overlay;
-// ---------------------------------------------------------------------------
-// Discrete sound helpers
-//
-// Small C ports of the MAME discrete-sound nodes used by the Midway/Taito
-// 8080 boards (Norton op-amp oscillators/VCOs/one-shots/VCAs, 555 astable,
-// LFSR noise, RC filters, mixers, R1 DACs, ...).  Each node is a struct that
-// is reset with its MAME "info" values and stepped once per output sample,
-// so the circuits below read almost 1:1 like the MAME DISCRETE_SOUND tables.
 
+// Discrete sound helpers
 #define OP_AMP_NORTON_VBE		0.5
 #define OP_AMP_VP_RAIL_OFFSET	1.5
 #define TTL_V_LOGIC_1			3.4
 
 enum { TRG_NONE = 0, TRG0, TRG0_INV, TRG1, TRG1_INV, TRG2, TRG2_INV, TRG01_AND, TRG01_NAND };
 
-static double disc_dt = 1.0 / 48000;	// sample time, set in disc_set_rate()
+static double disc_dt = 1.0 / 48000;
 static double disc_rate = 48000;
 
 static void disc_set_rate(INT32 rate)
@@ -224,7 +197,6 @@ static inline INT32 trig_func(INT32 t0, INT32 t1, INT32 t2, INT32 f)
 	return 1;
 }
 
-// DSS_LFSR_NOISE (17-bit, xor of 2 taps, shifted into bit 0, frequency clocked)
 struct d_lfsr {
 	UINT32 reg, reset_val;
 	INT32 bit0, bit1, outbit, bitlen;
@@ -258,7 +230,6 @@ struct d_lfsr {
 	}
 };
 
-// DSS_OP_AMP_OSC (subset used here)
 #define OSC_1		0x00
 #define OSC_VCO_1	0x20
 #define OSC_VCO_2	0x30
@@ -420,7 +391,6 @@ struct d_opamp_osc {
 	}
 };
 
-// DST_OP_AMP (Norton)
 struct opamp_info { double r1, r2, r3, r4, c, vN, vP; };
 
 struct d_opamp {
@@ -457,7 +427,6 @@ struct d_opamp {
 	}
 };
 
-// DST_OP_AMP_1SHT (Norton one-shot)
 struct opamp_1sht_info { double r1, r2, r3, r4, r5, c1, c2, vN, vP; };
 
 struct d_opamp_1sht {
@@ -492,7 +461,6 @@ struct d_opamp_1sht {
 	}
 };
 
-// DST_TVCA_OP_AMP (triggered Norton VCA)
 struct tvca_info {
 	double r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, c1, c2, c3, c4, v1, v2, v3, vP;
 	INT32 f0, f1, f2, f3, f4, f5;
@@ -573,7 +541,6 @@ struct d_tvca {
 	}
 };
 
-// DST_RCFILTER / DST_CRFILTER
 struct d_rc {
 	double exponent, v_out;
 	void reset(double r, double c) { exponent = rc_exp(r * c); v_out = 0; }
@@ -586,7 +553,6 @@ struct d_cr {
 	double step(double in) { double v_out = in - v_cap; v_cap += v_out * exponent; return v_out; }
 };
 
-// DSD_555_ASTBL
 #define D555_OUT_SQW	0x00
 #define D555_OUT_CAP	0x01
 #define D555_OUT_ENERGY	0x04
@@ -686,7 +652,6 @@ struct d_555_astable {
 	}
 };
 
-// DST_MIXER (resistor or op-amp type, with optional input/output caps)
 #define MIXER_IS_RESISTOR	0
 #define MIXER_IS_OP_AMP		1
 
@@ -741,7 +706,6 @@ struct d_mixer {
 	}
 };
 
-// DST_DAC_R1
 struct d_dac_r1 {
 	double v_step[256], v_out, exponent;
 	INT32 has_c;
@@ -768,7 +732,6 @@ struct d_dac_r1 {
 	}
 };
 
-// DSS_NOTE (frequency clocked, preloadable counter followed by a second counter)
 struct d_note {
 	double t_left, t_clock;
 	INT32 count1, count2, max1, max2;
@@ -794,7 +757,6 @@ struct d_note {
 	}
 };
 
-// DSS_SQUAREWFIX
 struct d_squarewfix {
 	double t_left, t_on, t_off;
 	INT32 flip_flop;
@@ -815,7 +777,6 @@ struct d_squarewfix {
 	}
 };
 
-// DST_OP_AMP_FILT (Norton high pass 0 / band pass 0)
 #define OPF_HIGH_PASS_0	0x40
 #define OPF_BAND_PASS_0	0x50
 
@@ -863,7 +824,6 @@ struct d_opamp_filt {
 	}
 };
 
-// DST_INTEGRATE (DISC_INTEGRATE_OP_AMP_2 | Norton)
 struct integrate_info { double r1, r2, r3, c, v1, vP; INT32 f0, f1, f2; };
 
 struct d_integrate {
@@ -888,15 +848,12 @@ struct d_integrate {
 	}
 };
 
-// 1-bit DAC ("speaker" device), with a little smoothing
 struct d_bitdac {
 	INT32 level;
 	double v;
 	void reset() { level = 0; v = 0; }
 	double step() { v += ((level ? 1.0 : 0.0) - v) * 0.5; return v; }
 };
-// ---------------------------------------------------------------------------
-// Color overlays (MAME layouts, blend="multiply", element coords as displayed)
 
 #define OVL(name, w, h, rot) static const ovl_layout name##_overlay = { name##_ovl, sizeof(name##_ovl) / sizeof(name##_ovl[0]), w, h, rot };
 
@@ -1089,9 +1046,7 @@ static void overlay_build()
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Palettes
-
 static UINT32 base_palette[256];
 static INT32 base_palette_count;
 
@@ -1163,16 +1118,22 @@ static void palette_update()
 				b = b * ((m >>  0) & 0xff) / 255;
 			}
 
+			if (light_add_r | light_add_g | light_add_b) {	// additive light
+				r += light_add_r; if (r > 255) r = 255;
+				g += light_add_g; if (g > 255) g = 255;
+				b += light_add_b; if (b > 255) b = 255;
+			}
+
 			DrvPalette[(c << 4) | o] = BurnHighCol(r, g, b, 0);
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Video
-
 static inline void set_pixel(INT32 x, INT32 y, INT32 color)
 {
+	x -= draw_xoffs;
+	if ((UINT32)x >= (UINT32)nScreenWidth) return;
 	if (flipscreen) { x = nScreenWidth - 1 - x; y = nScreenHeight - 1 - y; }
 	INT32 offs = y * nScreenWidth + x;
 	pTransDraw[offs] = (color << 4) | ovl_map[offs];
@@ -1286,7 +1247,7 @@ static void draw_polaris()
 {
 	for (INT32 offs = 0x400; offs < 0x2000; offs++)
 	{
-		INT32 y = (offs >> 5);		// 8 bit counter, as in MAME
+		INT32 y = (offs >> 5);
 		INT32 sy = y - 0x20;
 		INT32 x = (offs << 3) & 0xff;
 		UINT8 data = DrvMainRAM[offs];
@@ -1376,7 +1337,6 @@ static void cosmo_stars_init()
 
 static void draw_cosmo()
 {
-	// characters (the real board draws everything 4x wide, we use 1x)
 	for (INT32 offs = 0x400; offs < 0x2000; offs++)
 	{
 		INT32 y = (offs >> 5) - 0x20;
@@ -1461,11 +1421,7 @@ static void draw_spcenctr()
 
 		if (x == 0)
 		{
-			for (INT32 i = 0; i < 4; i++) {
-				pen = (video_data & 1) ? 0xff : brightness;
-				set_pixel(256 + i, y - 0x20, pen);
-				video_data >>= 1;
-			}
+			video_data = 0;
 
 			UINT8 trench_control = DrvMainRAM[((y << 5) | 0x1f) & 0x1fff];
 			if (trench_control & 0x40) draw_trench = 1;
@@ -1560,10 +1516,8 @@ static INT32 DrvDraw()
 
 	return 0;
 }
-// ---------------------------------------------------------------------------
-// Midway / Taito "Space Invaders" discrete sound board
-// (MAME mw8080bw_a.cpp invaders_discrete / invad2ct_discrete, D. Renaud)
 
+// Midway / Taito "Space Invaders" discrete sound board
 static const osc_info inv_saucer_hit_osc = { OSC_1 | OSC_NORTON | OSC_OUT_CAP, RES_M(1), RES_K(470), RES_K(100), RES_K(120), RES_M(1), 0, 0, 0, CAP_U(0.1), 12 };
 static const osc_info inv_saucer_hit_vco = { OSC_VCO_1 | OSC_NORTON | OSC_OUT_SQW, RES_M(1), RES_K(470), RES_K(680), RES_M(1), RES_M(1), 0, 0, 0, CAP_P(470), 12 };
 static const opamp_info inv_saucer_hit_B3_9  = { 0, RES_K(100), RES_M(1), 0, CAP_U(1), 0, 12 };
@@ -1729,9 +1683,7 @@ static void invaders_sound_reset(INT32 boards)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Taito "Polaris" discrete sound (MAME 8080bw_a.cpp polaris_discrete, D. Renaud)
-
+// Taito "Polaris" discrete sound
 static const opfilt_info polaris_music_filt = { RES_K(580), 0, 0, RES_M(2.2), RES_M(1), CAP_U(.01), 0, 0, 0, 12, 0 };
 static const opfilt_info polaris_nol_filt   = { 560, RES_K(6.8), RES_K(1002), RES_M(2.2), RES_M(1), CAP_U(.22), CAP_U(.22), CAP_U(1), 0, 12, 0 };
 static const opfilt_info polaris_noh_filt   = { 560, RES_K(6.8), RES_K(1002), RES_M(2.2), RES_M(1), CAP_U(.001), CAP_U(.001), CAP_U(.01), 0, 12, 0 };
@@ -1881,9 +1833,7 @@ static double polaris_sound_step()
 	return pol.mix_vr4.step(pol.sx5, in4);
 }
 
-// ---------------------------------------------------------------------------
-// Taito "Space Chaser" (MAME 8080bw_a.cpp schaser_discrete, D. Renaud)
-
+// Taito "Space Chaser" sound board
 #define SCHASER_HSYNC	18352.94
 #define SCHASER_4V		(SCHASER_HSYNC / 2 / 4)
 #define SCHASER_8V		(SCHASER_HSYNC / 2 / 8)
@@ -2002,10 +1952,7 @@ static void schaser_sh_port_1_write(UINT8 data)
 	SN76477_mixer_b_w(0, sch.explosion);
 }
 
-// ---------------------------------------------------------------------------
 // Taito "music" generator used by Balloon Bomber, Indian Battle and Lupin III
-// (preloadable counter -> 7492 -> R1 DAC -> CR filter)
-
 static struct {
 	INT32 data;
 	d_note note; d_dac_r1 dac; d_cr cr;
@@ -2025,13 +1972,11 @@ static void taito_music_reset(double clk, double gain)
 static double taito_music_step()
 {
 	INT32 n = tmus.note.step(1, tmus.data);
-	INT32 t = n + ((n > 2) ? 1 : 0);	// "01>0+" - convert count to 7492 output
+	INT32 t = n + ((n > 2) ? 1 : 0);
 	return tmus.cr.step(tmus.dac.step(t)) * tmus.gain;
 }
-// ---------------------------------------------------------------------------
-// Midway "tone generator" (MIDWAY_TONE_GENERATOR in MAME mw8080bw_a.cpp)
-// 12 bit counter clocked at 998.4kHz, flip-flop out, into a triggered Norton VCA
 
+// Midway "tone generator"
 static const tvca_info midway_music_tvca = { RES_M(3.3), RES_K(10) + RES_K(680), 0, RES_K(680), RES_K(10), 0, RES_K(680), 0, 0, 0, 0, CAP_U(.001), 0, 0, 0, 12, 0, 0, 12, TRG0, TRG_NONE, TRG1, TRG_NONE, TRG_NONE, TRG_NONE };
 static const tvca_info boothill_tone_tvca = { RES_M(3.3), RES_K(100) + RES_K(680), 0, RES_K(680), RES_K(10), 0, RES_K(680), 0, 0, 0, 0, CAP_U(.001), 0, 0, 0, 12, 0, 0, 12, TRG0, TRG_NONE, TRG1, TRG_NONE, TRG_NONE, TRG_NONE };
 
@@ -2053,13 +1998,9 @@ struct mw_tonegen {
 	}
 };
 
-// ---------------------------------------------------------------------------
 // Boot Hill (MAME boothill_discrete, D. Renaud) - stereo
-
 static const tvca_info boothill_shot_tvca = { RES_M(2.7), RES_K(510), 0, RES_K(510), RES_K(10), 0, RES_K(510), 0, 0, 0, 0, CAP_U(0.22), 0, 0, 0, 12, 0, 0, 12, TRG_NONE, TRG_NONE, TRG0, TRG_NONE, TRG_NONE, TRG_NONE };
 static const tvca_info boothill_hit_tvca  = { RES_M(2.7), RES_K(510), 0, RES_K(510), RES_K(10), 0, RES_K(510), 0, 0, 0, 0, 0, CAP_U(1), 0, 0, 12, 0, 0, 12, TRG_NONE, TRG_NONE, TRG0, TRG_NONE, TRG_NONE, TRG_NONE };
-
-// music adjuster: 1M..75k log, default 35% -> ~404k
 static const mixer_info boothill_l_mixer = { MIXER_IS_OP_AMP, { RES_K(12) + RES_K(68) + RES_K(33), RES_K(12) + RES_K(100) + RES_K(33) }, { 0 }, 0, RES_K(100), 0, CAP_U(0.1), 0, 7200 };
 static const mixer_info boothill_r_mixer = { MIXER_IS_OP_AMP, { RES_K(12) + RES_K(68) + RES_K(33), RES_K(12) + RES_K(100) + RES_K(33), RES_K(33) + 404000.0 }, { 0 }, 0, RES_K(100), 0, CAP_U(0.1), 0, 7200 };
 
@@ -2109,11 +2050,9 @@ static void boothill_sound_step(double *l, double *r)
 	*r = bh.rmix.step(bh.game_on, ri);
 }
 
-// ---------------------------------------------------------------------------
 // Generic "music only" for the other Midway tone generator games
 // (clowns, spacwalk, dogpatch, desertgu, dplay) - mixer modelled as a simple
-// coupling cap + gain, the effects of those boards are not emulated (yet).
-
+// coupling cap + gain, the effects of those boards are not yet emulated
 static struct {
 	mw_tonegen tone;
 	d_cr cr;
@@ -2138,178 +2077,301 @@ static double mwmusic_sound_step()
 	return mwmus.enable ? v : 0;
 }
 
-// ---------------------------------------------------------------------------
-// Gun Fight - C version of MAME's netlist (nl_gunfight.cpp, C. D. Howell)
-//
-// Each of the 4 effects (L/R shot, L/R hit) is a switch which charges a cap
-// to 16V, the cap then powers a common-emitter BJT stage whose base gets a
-// filtered zener noise signal and a bias derived from the same cap.  When the
-// cap is full the stage is saturated (silent), as it discharges through the
-// transistor it passes through the linear region and then cuts off, which
-// gives the "bang" + rattling tail.  The shot and hit for each side then go
-// into a common BJT mixing amp, a coupling cap, an RC low pass and the master
-// volume pot (midpoint).
+// Gun Fight
+#define GF_VT		0.025864	// thermal voltage at 27C (netlist default)
+#define GF_IS		1.95e-14	// BC548C
+#define GF_BF		466.0
+#define GF_BR		2.42
+#define GF_NF		0.993
+#define GF_NR		1.2
+
+struct gf_bjt {	// Ebers-Moll, as netlist QBJT_EB
+	double vbe, vbc;	// last junction voltages (for limiting)
+};
+
+static inline double gf_pnjlim(double vnew, double vold, double nvt)
+{
+	double vcrit = nvt * log(nvt / (M_SQRT2 * GF_IS));
+	if (vnew > vcrit && fabs(vnew - vold) > 2 * nvt) {
+		if (vold > 0) {
+			double arg = 1 + (vnew - vold) / nvt;
+			vnew = (arg > 0) ? vold + nvt * log(arg) : vcrit;
+		} else {
+			vnew = nvt * log(vnew / nvt);
+		}
+	}
+	return vnew;
+}
+
+template <int N>
+struct gf_mna {
+	double A[N][N], b[N];
+
+	void clear() { memset(A, 0, sizeof(A)); memset(b, 0, sizeof(b)); }
+	void g(INT32 i, INT32 j, double G) {		// conductance between nodes (-1 = ground)
+		if (i >= 0) A[i][i] += G;
+		if (j >= 0) A[j][j] += G;
+		if (i >= 0 && j >= 0) { A[i][j] -= G; A[j][i] -= G; }
+	}
+	void gv(INT32 i, double G, double V) {	// conductance from node i to a fixed voltage
+		A[i][i] += G; b[i] += G * V;
+	}
+	void cap(INT32 i, INT32 j, double C, double vprev) {	// backward euler companion model
+		double G = C / disc_dt;
+		g(i, j, G);
+		if (i >= 0) b[i] += G * vprev;
+		if (j >= 0) b[j] -= G * vprev;
+	}
+	void cap_v(INT32 i, double C, double vprev, double vother) {	// cap to a known voltage
+		double G = C / disc_dt;
+		A[i][i] += G; b[i] += G * (vprev + vother);
+	}
+	void bjt(INT32 nb, INT32 nc, INT32 ne, const double *v, gf_bjt *q) {
+		const double af = GF_BF / (1 + GF_BF), ar = GF_BR / (1 + GF_BR);
+		const double nvf = GF_NF * GF_VT, nvr = GF_NR * GF_VT;
+		double vb = (nb >= 0) ? v[nb] : 0, vc = (nc >= 0) ? v[nc] : 0, ve = (ne >= 0) ? v[ne] : 0;
+		double vbe = gf_pnjlim(vb - ve, q->vbe, nvf);
+		double vbc = gf_pnjlim(vb - vc, q->vbc, nvr);
+		q->vbe = vbe; q->vbc = vbc;
+		double ebe = exp(vbe / nvf), ebc = exp(vbc / nvr);
+		double ibe = (GF_IS / af) * (ebe - 1), gbe = (GF_IS / af) * ebe / nvf + 1e-12;
+		double ibc = (GF_IS / ar) * (ebc - 1), gbc = (GF_IS / ar) * ebc / nvr + 1e-12;
+		// terminal currents flowing into the device
+		double ie = -(ibe - ar * ibc);			// into emitter (negative for npn forward)
+		double ic = af * ibe - ibc;				// into collector
+		double ib = -(ic + ie);
+		// partial derivatives wrt vbe / vbc
+		double dic_be = af * gbe, dic_bc = -gbc;
+		double die_be = -gbe, die_bc = ar * gbc;
+		double dib_be = -(dic_be + die_be), dib_bc = -(dic_bc + die_bc);
+		INT32 n[3] = { nb, nc, ne };
+		double I[3] = { ib, ic, ie };
+		double dbe[3] = { dib_be, dic_be, die_be };
+		double dbc[3] = { dib_bc, dic_bc, die_bc };
+		for (INT32 t = 0; t < 3; t++) {
+			if (n[t] < 0) continue;
+			// dI/dvb = dbe + dbc, dI/dvc = -dbc, dI/dve = -dbe
+			double d[3] = { dbe[t] + dbc[t], -dbc[t], -dbe[t] };
+			double lin = I[t] - dbe[t] * vbe - dbc[t] * vbc;
+			for (INT32 k = 0; k < 3; k++) if (n[k] >= 0) A[n[t]][n[k]] += d[k];
+			b[n[t]] -= lin;
+		}
+	}
+	void solve(double *x) {	// gaussian elimination, partial pivoting
+		for (INT32 c = 0; c < N; c++) {
+			INT32 p = c;
+			for (INT32 r = c + 1; r < N; r++) if (fabs(A[r][c]) > fabs(A[p][c])) p = r;
+			if (p != c) {
+				for (INT32 k = 0; k < N; k++) { double t = A[c][k]; A[c][k] = A[p][k]; A[p][k] = t; }
+				double t = b[c]; b[c] = b[p]; b[p] = t;
+			}
+			double d = A[c][c];
+			if (d == 0) d = 1e-30;
+			for (INT32 r = c + 1; r < N; r++) {
+				double f = A[r][c] / d;
+				if (f == 0) continue;
+				for (INT32 k = c; k < N; k++) A[r][k] -= f * A[c][k];
+				b[r] -= f * b[c];
+			}
+		}
+		for (INT32 r = N - 1; r >= 0; r--) {
+			double s = b[r];
+			for (INT32 k = r + 1; k < N; k++) s -= A[r][k] * x[k];
+			x[r] = s / ((A[r][r] != 0) ? A[r][r] : 1e-30);
+		}
+	}
+};
+
+// sound effect generator
+enum { GV_S = 0, GV_X, GV_F, GV_B, GV_EM, GV_C, GV_E, GV_O, GV_W, GV_Y, GV_N };
 
 struct gf_voice_info {
-	double c_env;		// C122/C116
-	double r_lp1, c_lp1;	// R129 C121 / R116 C115
-	double c_lp2;		// C120 / C114 (with R128 || bias network)
-	double re;			// emitter resistor (100 shot, 1k hit)
-	double c_e;			// emitter bypass (0 for shot)
-	double c_out, c_out_gnd;	// C119 / C118
+	double c_in;		// C303/C306/C304/C305 noise coupling
+	double r_f1, c_f1;	// first low pass (R129/C121)
+	double r_f2, c_f2;	// second low pass (R128/C120)
+	double c_env;		// supply cap (C122/C116)
+	double r_e, c_e;	// emitter resistor and bypass cap (0 = none)
+	double c_out, c_out_g;	// output coupling C119 and filter C118
+	double c_mix;		// C117 / C110
 };
 
 static const gf_voice_info gf_voice_infos[4] = {
-	{ CAP_U(10), RES_K(20), CAP_U(0.015), CAP_U(0.01),  100,  0,          CAP_U(0.047), CAP_U(0.022) },	// left shot
-	{ CAP_U(10), RES_K(20), CAP_U(0.015), CAP_U(0.015), 100,  0,          CAP_U(0.047), CAP_U(0.022) },	// right shot
-	{ CAP_U(20), RES_K(20), CAP_U(0.033), CAP_U(0.1),   1000, CAP_U(50),  CAP_U(0.1),   CAP_U(0.033) },	// left hit
-	{ CAP_U(20), RES_K(20), CAP_U(0.033), CAP_U(0.047), 1000, CAP_U(50),  CAP_U(0.1),   CAP_U(0.033) },	// right hit
+	{ CAP_U(0.1), RES_K(20), CAP_U(0.015), RES_K(30), CAP_U(0.01),  CAP_U(10), 100,        0,         CAP_U(0.047), CAP_U(0.022), CAP_U(0.047) },	// left shot
+	{ CAP_U(0.1), RES_K(20), CAP_U(0.015), RES_K(30), CAP_U(0.015), CAP_U(10), 100,        0,         CAP_U(0.047), CAP_U(0.022), CAP_U(0.047) },	// right shot
+	{ CAP_U(0.1), RES_K(20), CAP_U(0.033), RES_K(30), CAP_U(0.1),   CAP_U(20), RES_K(1),   CAP_U(50), CAP_U(0.1),   CAP_U(0.033), CAP_U(0.1)   },	// left hit
+	{ CAP_U(0.1), RES_K(20), CAP_U(0.033), RES_K(30), CAP_U(0.047), CAP_U(20), RES_K(1),   CAP_U(50), CAP_U(0.1),   CAP_U(0.033), CAP_U(0.1)   },	// right hit
 };
+
+#define GF_NOISE_RS		(3400.0 * 4)	// Q302 collector impedance, shared by 4 inputs
+#define GF_POT_HALF		0.5
 
 struct gf_voice {
-	double env, lp1, lp2, ve, hp_cap, lp_out;
-	double k_lp1, k_lp2, k_ve, k_hp, k_lpo;
+	double v[GV_N];
+	gf_bjt q;
+	INT32 idle;
 
-	void reset(const gf_voice_info *i) {
-		env = lp1 = lp2 = ve = hp_cap = lp_out = 0;
-		k_lp1 = rc_exp(i->r_lp1 * i->c_lp1);
-		k_lp2 = rc_exp(((RES_K(30) * 27500.0) / (RES_K(30) + 27500.0)) * i->c_lp2);
-		k_ve  = (i->c_e != 0) ? rc_exp(i->re * i->c_e) : 0;
-		k_hp  = rc_exp(RES_K(50) * i->c_out);
-		k_lpo = rc_exp(RES_K(5.1) * i->c_out_gnd);
-	}
+	void reset() { memset(v, 0, sizeof(v)); q.vbe = q.vbc = 0; idle = 0; }
 
-	double step(const gf_voice_info *i, INT32 sw, double noise) {
-		// envelope cap: switch (15 ohm) charges to 16V
-		if (sw) env += (16.0 - env) * (1.0 - exp(-disc_dt / (15.0 * i->c_env)));
+	void step(const gf_voice_info *i, INT32 sw, double vn, double vz) {
+		if (!sw && idle) return;	// nothing audible left, the circuit is frozen
 
-		// base: bias divider R126 330k / R127 30k from the envelope + filtered noise
-		lp1 += (noise - lp1) * k_lp1;
-		lp2 += (lp1 - lp2) * k_lp2;
-		double vb = env * (30.0 / 360.0) + lp2 * (27.5 / 57.5);
+		double old[GV_N];
+		memcpy(old, v, sizeof(old));
 
-		double ic;
-		if (i->c_e != 0) {
-			// bypassed emitter: dc set by emitter cap, ac gain set by re
-			double vbe = vb - 0.65;
-			double target = (vbe > 0) ? vbe : 0;
-			ve += (target - ve) * k_ve;
-			ic = ve / i->re + (vbe - ve) / 25.0;
-		} else {
-			ic = (vb - 0.65) / i->re;
+		const double pot1 = RES_K(50) * (1.0 - GF_POT_HALF), pot2 = RES_K(50) * GF_POT_HALF;
+
+		for (INT32 it = 0; it < 8; it++) {
+			gf_mna<GV_N> m;
+			m.clear();
+
+			m.gv(GV_S, 1.0 / GF_NOISE_RS, vn);						// noise source
+			m.cap(GV_S, GV_X, i->c_in, old[GV_S] - old[GV_X]);		// C303
+			m.g(GV_X, GV_F, 1.0 / i->r_f1);							// R129
+			m.cap(GV_F, -1, i->c_f1, old[GV_F]);					// C121
+			m.g(GV_F, GV_B, 1.0 / i->r_f2);							// R128
+			m.cap(GV_B, -1, i->c_f2, old[GV_B]);					// C120
+			m.g(GV_E, GV_B, 1.0 / RES_K(330));						// R126
+			m.g(GV_B, -1, 1.0 / RES_K(30));							// R127
+			m.g(GV_EM, -1, 1.0 / i->r_e);							// R125 / R112
+			if (i->c_e != 0) m.cap(GV_EM, -1, i->c_e, old[GV_EM]);	// C113
+			m.g(GV_E, GV_C, 1.0 / RES_K(5.1));						// R124
+			m.cap(GV_E, -1, i->c_env, old[GV_E]);					// C122
+			if (sw) m.gv(GV_E, 1.0 / (15.0 + 0.1), 16.0);			// switch (RON 0.1) + R130
+			m.cap(GV_C, GV_O, i->c_out, old[GV_C] - old[GV_O]);		// C119
+			m.cap(GV_O, -1, i->c_out_g, old[GV_O]);					// C118
+			m.g(GV_O, GV_W, 1.0 / pot1);							// R123 (pot)
+			m.g(GV_W, -1, 1.0 / pot2);
+			m.g(GV_W, GV_Y, 1.0 / RES_K(30));						// R122
+			m.cap_v(GV_Y, i->c_mix, old[GV_Y] - vz, vz);			// C117 to the mixing amp base
+			m.bjt(GV_B, GV_C, GV_EM, v, &q);						// Q106
+
+			double x[GV_N];
+			m.solve(x);
+
+			double dmax = 0;
+			for (INT32 k = 0; k < GV_N; k++) { double d = fabs(x[k] - v[k]); if (d > dmax) dmax = d; v[k] = x[k]; }
+			if (dmax < 1e-7) break;
 		}
-		if (ic < 0) ic = 0;
 
-		double vc = env - ic * RES_K(5.1);
-		if (vc < 0.1) { vc = (env > 0.1) ? 0.1 : env; ic = (env - vc) / RES_K(5.1); }
-
-		// discharge of the envelope cap: transistor + R126/R127
-		if (!sw) {
-			env -= (ic + env / RES_K(360)) * disc_dt / i->c_env;
-			if (env < 0) env = 0;
-		}
-
-		// output coupling: C119 into the volume pot, C118 to ground
-		double hp = vc - hp_cap;
-		hp_cap += hp * k_hp;
-		lp_out += (hp - lp_out) * k_lpo;
-
-		return lp_out * 0.5;	// pot at midpoint
+		// transistor cut off and the output settled -> freeze until the next trigger
+		idle = (!sw && (v[GV_B] - v[GV_EM]) < 0.3 && fabs(v[GV_O]) < 1e-5 && fabs(v[GV_W]) < 1e-5 && fabs(v[GV_C] - v[GV_E]) < 1e-3);
 	}
 };
 
-struct gf_side {
-	double cin_s, cin_h, ve, out_cap, out_lp;
-	double k_in_s, k_in_h, k_out, k_lp;
+// mixing amp + output
+enum { GM_Z = 0, GM_EM, GM_C, GM_Q, GM_P, GM_OUT, GM_N };
 
-	void reset(double c_shot, double c_hit) {
-		cin_s = cin_h = ve = out_cap = out_lp = 0;
-		k_in_s = rc_exp(RES_K(30) * c_shot);
-		k_in_h = rc_exp(RES_K(30) * c_hit);
-		k_out  = rc_exp((RES_K(30) + RES_K(47)) * CAP_U(0.047));
-		k_lp   = rc_exp(RES_K(30) * CAP_U(0.001));
-	}
+struct gf_mixer {
+	double v[GM_N];
+	gf_bjt q;
 
-	double step(double shot, double hit) {
-		// input coupling caps (R122/C117, R109/C110)
-		double s = shot - cin_s; cin_s += s * k_in_s;
-		double h = hit - cin_h;  cin_h += h * k_in_h;
+	void reset() { memset(v, 0, sizeof(v)); q.vbe = q.vbc = 0; }
 
-		// common emitter amp Q102: ~2.36k input impedance, gain ~ -392 (5.1k / 13 ohm)
-		double vin = (s + h) * 0.5 * (2360.0 / (RES_K(30) + 2360.0));
-		double vc = 5.8 - vin * 392.0;
-		if (vc > 16.0) vc = 16.0;
-		if (vc < 2.1) vc = 2.1;
+	double step(double ys, double ys_old, double yh, double yh_old, double c_s, double c_h) {
+		double old[GM_N];
+		memcpy(old, v, sizeof(old));
 
-		// C108 coupling, R104/C107 low pass, master volume pot midpoint
-		double o = vc - out_cap; out_cap += o * k_out;
-		out_lp += (o - out_lp) * k_lp;
-		return out_lp * 0.5;
+		const double pot1 = RES_K(47) * (1.0 - GF_POT_HALF), pot2 = RES_K(47) * GF_POT_HALF;
+
+		for (INT32 it = 0; it < 8; it++) {
+			gf_mna<GM_N> m;
+			m.clear();
+
+			m.cap_v(GM_Z, c_s, old[GM_Z] - ys_old, ys);		// C117 (shot)
+			m.cap_v(GM_Z, c_h, old[GM_Z] - yh_old, yh);		// C110 (hit)
+			m.gv(GM_Z, 1.0 / RES_K(150), 16.0);				// R107
+			m.g(GM_Z, -1, 1.0 / RES_K(30));					// R105
+			m.g(GM_EM, -1, 1.0 / RES_K(1));					// R106
+			m.cap(GM_EM, -1, CAP_U(50), old[GM_EM]);		// C109
+			m.gv(GM_C, 1.0 / RES_K(5.1), 16.0);				// R108
+			m.cap(GM_C, GM_Q, CAP_U(0.047), old[GM_C] - old[GM_Q]);	// C108
+			m.g(GM_Q, GM_P, 1.0 / RES_K(30));				// R104
+			m.cap(GM_P, -1, CAP_U(0.001), old[GM_P]);		// C107
+			m.g(GM_P, GM_OUT, 1.0 / pot1);					// R103 (master volume)
+			m.g(GM_OUT, -1, 1.0 / pot2);
+			m.bjt(GM_Z, GM_C, GM_EM, v, &q);				// Q102
+
+			double x[GM_N];
+			m.solve(x);
+
+			double dmax = 0;
+			for (INT32 k = 0; k < GM_N; k++) { double d = fabs(x[k] - v[k]); if (d > dmax) dmax = d; v[k] = x[k]; }
+			if (dmax < 1e-7) break;
+		}
+
+		return v[GM_OUT];
 	}
 };
 
 static struct {
 	INT32 sw[4];		// left shot, right shot, left hit, right hit
 	gf_voice v[4];
-	gf_side side[2];
-	double noise_t, noise_val, noise_lp;
+	gf_mixer mix[2];
+	double y_old[4];
+	double noise_t, noise_val;
 	UINT32 rng;
+	INT32 have_gauss;
+	double gauss2;
 } gf;
 
 static void gunfight_sound_reset()
 {
-	for (INT32 i = 0; i < 4; i++) { gf.sw[i] = 0; gf.v[i].reset(&gf_voice_infos[i]); }
-	gf.side[0].reset(CAP_U(0.047), CAP_U(0.1));
-	gf.side[1].reset(CAP_U(0.047), CAP_U(0.1));
-	gf.noise_t = gf.noise_val = gf.noise_lp = 0;
+	memset(&gf, 0, sizeof(gf));
+	for (INT32 i = 0; i < 4; i++) gf.v[i].reset();
+	gf.mix[0].reset();
+	gf.mix[1].reset();
 	gf.rng = 0x12345678;
 }
 
-static double gf_gauss()
+static double gf_gauss()	// box-muller, sigma 1
 {
-	// sum of 4 uniforms, roughly gaussian, sigma ~1
-	double s = 0;
-	for (INT32 i = 0; i < 4; i++) {
+	if (gf.have_gauss) { gf.have_gauss = 0; return gf.gauss2; }
+	double u1, u2;
+	do {
 		gf.rng = gf.rng * 1664525 + 1013904223;
-		s += (double)(gf.rng >> 8) / 16777216.0;
-	}
-	return (s - 2.0) * 1.73;
+		u1 = (double)((gf.rng >> 8) + 1) / 16777217.0;
+		gf.rng = gf.rng * 1664525 + 1013904223;
+		u2 = (double)(gf.rng >> 8) / 16777216.0;
+	} while (u1 <= 0);
+	double r = sqrt(-2.0 * log(u1));
+	gf.gauss2 = r * sin(2 * M_PI * u2);
+	gf.have_gauss = 1;
+	return r * cos(2 * M_PI * u2);
 }
 
 static void gunfight_sound_step(double *l, double *r)
 {
-	// zener noise amplified by Q302, sampled at 24kHz
+	// zener noise (2mV RMS, 24kHz clock) amplified by Q302: ic = vn * beta / (r_pi + r_z) ~ vn / 54.6,
+	// into ~3.4k -> about 62x open circuit
 	gf.noise_t += disc_dt;
 	while (gf.noise_t >= 1.0 / 24000) {
 		gf.noise_t -= 1.0 / 24000;
-		gf.noise_val = gf_gauss() * 0.5;
+		gf.noise_val = gf_gauss() * 0.002 * 62.4;
 	}
 
-	double ls = gf.v[0].step(&gf_voice_infos[0], gf.sw[0], gf.noise_val);
-	double rs = gf.v[1].step(&gf_voice_infos[1], gf.sw[1], gf.noise_val);
-	double lh = gf.v[2].step(&gf_voice_infos[2], gf.sw[2], gf.noise_val);
-	double rh = gf.v[3].step(&gf_voice_infos[3], gf.sw[3], gf.noise_val);
+	for (INT32 i = 0; i < 4; i++) {
+		gf.y_old[i] = gf.v[i].v[GV_Y];
+		gf.v[i].step(&gf_voice_infos[i], gf.sw[i], gf.noise_val, gf.mix[i & 1].v[GM_Z]);
+	}
 
-	*l = gf.side[0].step(ls, lh);
-	*r = gf.side[1].step(rs, rh);
+	*l = gf.mix[0].step(gf.v[0].v[GV_Y], gf.y_old[0], gf.v[2].v[GV_Y], gf.y_old[2], gf_voice_infos[0].c_mix, gf_voice_infos[2].c_mix);
+	*r = gf.mix[1].step(gf.v[1].v[GV_Y], gf.y_old[1], gf.v[3].v[GV_Y], gf.y_old[3], gf_voice_infos[1].c_mix, gf_voice_infos[3].c_mix);
 }
 
 static void gunfight_sound_w(UINT8 data)
 {
-	// the 74175 latches and inverts the top 4 bits
+	// the 74175 latches and inverts the top 4 bits; the 74156 decoder turns on one switch
+	// a selected switch is only turned on, any other value turns all of them off
 	INT32 sel = (~data >> 4) & 0x0f;
-	for (INT32 i = 0; i < 4; i++) gf.sw[i] = 0;
-	if (sel >= 1 && sel <= 4) gf.sw[sel - 1] = 1;
+	if (sel >= 1 && sel <= 4) {
+		gf.sw[sel - 1] = 1;
+	} else {
+		for (INT32 i = 0; i < 4; i++) gf.sw[i] = 0;
+	}
 }
 
-// ---------------------------------------------------------------------------
-// 280-ZZZAP / Laguna Racer - C version of MAME's netlist (nl_280zzzap.cpp,
-// C. D. Howell), behavioural: engine speed voltage with pedal "inertia" and
-// gear shift lag, three triangle oscillators (one modulating the other two
-// through the MC3340 attenuator), noise: tire skid (1kHz bandpass, Q 25),
-// post-crash (saturated low pass noise) and crash boom (60Hz bandpass, Q 19).
-
-struct zz_bp {	// state variable band pass
+// 280-ZZZAP / Laguna Racer sound board
+struct zz_bp {
 	double lo, bp, f, q;
 	void reset(double fc, double qv) { lo = bp = 0; f = 2.0 * sin(M_PI * fc * disc_dt); q = 1.0 / qv; }
 	double step(double in) {
@@ -2439,8 +2501,179 @@ static double zzzap_sound_step()
 
 	return o / 1.25;
 }
-// ---------------------------------------------------------------------------
-// Sound: stream (synced to the cpu) for the discrete circuits / SN76477 / 1 bit dac
+
+// Space Encounters
+struct d_filter2 {
+	double a1, a2, b0, b1, b2, x1, x2, y1, y2;
+	void reset_bp(double fc, double d) {
+		double sr = disc_rate;
+		double two_over_T = 2 * sr, tt2 = two_over_T * two_over_T;
+		double wc = sr * 2.0 * tan(M_PI * fc / sr), wc2 = wc * wc;
+		double den = tt2 + d * wc * two_over_T + wc2;
+		a1 = 2.0 * (-tt2 + wc2) / den;
+		a2 = (tt2 - d * wc * two_over_T + wc2) / den;
+		b0 = d * wc * two_over_T / den; b1 = 0; b2 = -b0;
+		x1 = x2 = y1 = y2 = 0;
+	}
+	double step(double in) {
+		double v = -a1 * y1 - a2 * y2 + b0 * in + b1 * x1 + b2 * x2;
+		x2 = x1; x1 = in; y2 = y1; y1 = v;
+		return v;
+	}
+};
+
+struct d_opfilt_bp1m_norton {	// DST_OP_AMP_FILT, BAND_PASS_1M | NORTON
+	d_filter2 f;
+	double vRef, vP, vN;
+	void reset(const opfilt_info *i) {
+		double rTotal = (i->r2 == 0) ? i->r1 : RES_2_PARALLEL(i->r1, i->r2);
+		double fc = 1.0 / (2 * M_PI * sqrt(rTotal * i->rF * i->c1 * i->c2));
+		double d  = (i->c1 + i->c2) / sqrt(i->rF / rTotal * i->c1 * i->c2);
+		double gain = -i->rF / rTotal * i->c2 / (i->c1 + i->c2);
+		f.reset_bp(fc, d);
+		f.b0 *= gain; f.b1 *= gain; f.b2 *= gain;
+		vRef = (i->vP - OP_AMP_NORTON_VBE) / i->r3 * i->rF;
+		vP = i->vP - OP_AMP_NORTON_VBE;
+		vN = i->vN;
+	}
+	double step(double in) {
+		double v = in - OP_AMP_NORTON_VBE;
+		if (v < 0) v = 0;
+		double v_out = -f.a1 * f.y1 - f.a2 * f.y2 + f.b0 * v + f.b1 * f.x1 + f.b2 * f.x2 + vRef;
+		f.x2 = f.x1; f.x1 = v; f.y2 = f.y1;
+		if (v_out > vP) v_out = vP;
+		if (v_out < vN) v_out = vN;
+		f.y1 = v_out - vRef;
+		return v_out;
+	}
+};
+
+static const opamp_info spcenctr_enemy_shot_E1 = { 0, RES_K(510), RES_M(2.2), RES_M(2.2), CAP_U(0.1), 0, 12 };
+static const osc_info spcenctr_enemy_shot_osc = { OSC_VCO_3 | OSC_NORTON | OSC_OUT_SQW, RES_K(560), RES_K(7.5), RES_K(22), RES_K(47), RES_K(100), 0, 0, 0, CAP_U(0.0022), 12 };
+static const opamp_info spcenctr_enemy_shot_D1 = { RES_K(100), RES_K(100), RES_M(2.7), RES_K(100), 0, 0, 12 };
+static const opfilt_info spcenctr_enemy_shot_filt = { RES_K(100), RES_K(10), RES_M(4.3), 0, RES_M(2.2), CAP_U(0.001), CAP_U(0.001), 0, 0, 12, 0 };
+static const opamp_1sht_info spcenctr_player_shot_1sht = { RES_M(4.7), RES_K(100), RES_M(1), RES_M(1), RES_M(2.2), CAP_U(1), CAP_P(470), 0, 12 };
+static const opamp_info spcenctr_player_shot_E1 = { 0, RES_K(10), RES_M(1.5), 0, CAP_U(0.22), 0, 12 };
+static const osc_info spcenctr_player_shot_osc = { OSC_VCO_3 | OSC_NORTON | OSC_OUT_SQW, 1.0 / (1.0 / RES_M(1) + 1.0 / RES_K(330)) + RES_M(1.5),
+	RES_M(1), RES_K(560), RES_M(2.7), RES_M(1), RES_M(4.7), RES_M(3.3), 0, CAP_P(330), 12 };
+static const opamp_info spcenctr_player_shot_C1 = { RES_K(560), RES_K(470), RES_M(2.7), RES_K(560), 0, 0, 12 };
+static const tvca_info spcenctr_player_shot_tvca = { RES_M(2.7), RES_K(560), 0, RES_K(560), RES_K(1), 0, RES_K(560), 0, 0, 0, 0, CAP_U(1), 0, 0, 0, 12, 0, 0, 12, TRG_NONE, TRG_NONE, TRG0, TRG_NONE, TRG_NONE, TRG_NONE };
+static const tvca_info spcenctr_crash_tvca = { RES_M(2.7), RES_K(470), 0, RES_K(470), RES_K(1), 0, RES_K(470), 0, 0, 0, 0, CAP_U(2.2), 0, 0, 0, 5, 0, 0, 12, TRG_NONE, TRG_NONE, TRG0, TRG_NONE, TRG_NONE, TRG_NONE };
+static const tvca_info spcenctr_explosion_tvca = { RES_M(2.7), RES_K(680), 0, RES_K(680), RES_K(1), 0, RES_K(680), 0, 0, 0, 0, CAP_U(2.2), 0, 0, 0, 12, 0, 0, 12, TRG_NONE, TRG_NONE, TRG0, TRG_NONE, TRG_NONE, TRG_NONE };
+static const mixer_info spcenctr_mixer = { MIXER_IS_RESISTOR,
+	{ RES_K(15), RES_K(15), RES_K(22), RES_K(3.6), RES_K(1.8) + RES_K(3.6) + RES_K(4.7), RES_K(27), RES_K(27) },
+	{ 0, CAP_U(0.001), CAP_U(0.1), CAP_U(1), 0, 0, CAP_U(10) }, 0, 0, 0, CAP_U(1), 0, 1 };
+
+static struct {
+	INT32 enemy_shot, player_shot, crash, explosion, bonus;
+	INT32 strobe_enable, lamp;
+	d_lfsr noise;
+	d_opamp es_e1, es_d1;
+	d_opamp_osc es_osc;
+	d_opfilt_bp1m_norton es_filt;
+	d_cr es_cr;
+	d_opamp_1sht ps_1sht;
+	d_opamp ps_e1, ps_c1;
+	d_cr ps_cr;
+	d_opamp_osc ps_osc;
+	d_tvca ps_tvca, crash_tvca, exp_tvca;
+	d_filter2 crash_filt;
+	d_rc exp_rc1, exp_rc2;
+	d_555_astable bonus1, bonus2;
+	d_mixer mix;
+} sec;
+
+static void spcenctr_sound_relink()
+{
+	sec.es_e1.info = &spcenctr_enemy_shot_E1;
+	sec.es_osc.info = &spcenctr_enemy_shot_osc;
+	sec.es_d1.info = &spcenctr_enemy_shot_D1;
+	sec.ps_1sht.info = &spcenctr_player_shot_1sht;
+	sec.ps_e1.info = &spcenctr_player_shot_E1;
+	sec.ps_osc.info = &spcenctr_player_shot_osc;
+	sec.ps_c1.info = &spcenctr_player_shot_C1;
+	sec.ps_tvca.info = &spcenctr_player_shot_tvca;
+	sec.crash_tvca.info = &spcenctr_crash_tvca;
+	sec.exp_tvca.info = &spcenctr_explosion_tvca;
+	sec.mix.info = &spcenctr_mixer;
+}
+
+static void spcenctr_sound_reset()
+{
+	sec.enemy_shot = sec.player_shot = sec.crash = sec.explosion = sec.bonus = 0;
+	sec.strobe_enable = sec.lamp = 0;
+	sec.noise.reset(7515, 12, 12.0 / 2, 0x1ffff, 4, 16, 12);	// midway_lfsr
+	sec.es_e1.reset(&spcenctr_enemy_shot_E1);
+	sec.es_osc.reset(&spcenctr_enemy_shot_osc);
+	sec.es_d1.reset(&spcenctr_enemy_shot_D1);
+	sec.es_filt.reset(&spcenctr_enemy_shot_filt);
+	sec.es_cr.reset(RES_K(1.8), CAP_U(0.1));
+	sec.ps_1sht.reset(&spcenctr_player_shot_1sht);
+	sec.ps_e1.reset(&spcenctr_player_shot_E1);
+	sec.ps_cr.reset(RES_M(1) + RES_K(330), CAP_U(0.1));
+	sec.ps_osc.reset(&spcenctr_player_shot_osc);
+	sec.ps_c1.reset(&spcenctr_player_shot_C1);
+	sec.ps_tvca.reset(&spcenctr_player_shot_tvca);
+	sec.crash_tvca.reset(&spcenctr_crash_tvca);
+	sec.crash_filt.reset_bp(130, 1.0 / 8);
+	sec.exp_tvca.reset(&spcenctr_explosion_tvca);
+	sec.exp_rc1.reset(RES_K(1.8), CAP_U(0.22));
+	sec.exp_rc2.reset(RES_K(1.8) + RES_K(3.6), CAP_U(0.22));
+	sec.bonus1.reset(D555_OUT_SQW, 5, -1, -1);
+	sec.bonus2.reset(D555_OUT_SQW, 5, -1, -1);
+	sec.mix.reset(&spcenctr_mixer, 7);
+}
+
+static double spcenctr_sound_step()
+{
+	double noise = sec.noise.step(1, 0);
+
+	// enemy ship shot
+	double n20 = sec.es_e1.step(0, sec.enemy_shot ? 12 : 0);
+	double n21 = sec.es_osc.step(1, n20, 0);
+	double n22 = sec.es_d1.step(n21, n20);
+	double enemy = sec.es_cr.step(sec.es_filt.step(n22));
+
+	// player shot
+	double n30 = sec.ps_1sht.step(sec.player_shot ? 12 : 0);
+	double n31 = sec.ps_e1.step(0, n30);
+	double n33 = n31 - 0.5;	// D502
+	if (n33 < 0) n33 = 0;
+	if (n33 > 12) n33 = 12;
+	double n35 = sec.ps_cr.step(noise) * (RES_K(330) / (RES_M(1) + RES_K(330)));
+	double n36 = sec.ps_osc.step(1, n35, n33);
+	double n37 = sec.ps_c1.step(n36, n33);
+	double player = sec.ps_tvca.step(sec.player_shot, 0, 0, n37, 0);
+
+	// crash
+	double n60 = sec.crash_tvca.step(sec.crash, 0, 0, noise, 0);
+	double crash = sec.crash_filt.step(n60 - 6.8) * 6 + 6.8;
+	if (crash < 0) crash = 0;
+	if (crash > 12.0 - OP_AMP_NORTON_VBE) crash = 12.0 - OP_AMP_NORTON_VBE;
+
+	// explosion
+	double expl = sec.exp_rc2.step(sec.exp_rc1.step(sec.exp_tvca.step(sec.explosion, 0, 0, noise, 0)));
+
+	// bonus
+	double b1 = sec.bonus1.step(sec.bonus, RES_K(1), RES_K(27), CAP_U(0.047));
+	double b2 = sec.bonus2.step(sec.bonus, RES_K(100), RES_K(47), CAP_U(1));
+	double bonus = (b1 != 0 && b2 != 0 && sec.bonus) ? TTL_V_LOGIC_1 : 0;
+
+	double in[7] = { enemy, player, 0, crash, expl, bonus, 0 };
+	return sec.mix.step(1, in);
+}
+
+static void spcenctr_sound_p1_w(UINT8 data)
+{
+	sound_mute = (~data) & 1;
+	sec.crash = (data >> 2) & 1;
+}
+
+static void spcenctr_sound_p2_w(UINT8 data)
+{
+	sec.explosion = (data >> 4) & 1;
+	sec.player_shot = (data >> 5) & 1;
+}
 
 static Stream snd_stream;
 static d_bitdac bitdac;
@@ -2449,10 +2682,7 @@ static INT32 sn_chips;
 static double sn_gain;
 static double disc_gain;
 
-// Taito (and other) games that MAME runs with the "invaders" samples get the
-// generated Space Invaders sound board instead (inv_board[0]).  The games set
-// "sample lines" (0 = missile .. 8 = bonus base, the MAME sample numbers), which
-// drive the matching circuit of the board.
+// Taito (and other) games that runs on invaders hw
 static INT32 inv_extra;		// board used in addition to the game's own sound type
 static double inv_gain;
 static UINT16 inv_lines[3];	// per sound port
@@ -2546,6 +2776,10 @@ static void snd_stream_update(INT16 **streams, INT32 samples)
 				l = r = mwmusic_sound_step() * disc_gain;
 			break;
 
+			case SND_SPCENCTR:
+				l = r = spcenctr_sound_step() * disc_gain + sn0 * sn_gain;
+			break;
+
 			default:
 				l = r = sn0 * sn_gain;
 			break;
@@ -2608,6 +2842,14 @@ static void sound_init()
 			sn_chips = 2;
 		break;
 
+		case SND_SPCENCTR:
+			SN76477_init(0);
+			SN76477_set_mastervol(0, 4.5);
+			sn76477_invaders_saucer(0, CAP_U(0.047), RES_K(56));
+			SN76477_set_slf_params(0, CAP_U(1.0), RES_K(150));
+			sn_chips = 1;
+		break;
+
 		case SND_SCHASER:
 			SN76477_init(0);
 			SN76477_set_mastervol(0, 10.0);
@@ -2637,6 +2879,7 @@ static void sound_init()
 		case SND_INVAD2CT:	disc_gain = 2500 * 0.5; sn_gain = 0.3; break;
 		case SND_POLARIS:	disc_gain = 1.0 * 0.50; break;
 		case SND_SCHASER:	disc_gain = 33080 * 0.65; break;
+		case SND_SPCENCTR:	disc_gain = 20000 * 0.45; sn_gain = 0.2; break;
 		case SND_LUPIN3:	disc_gain = 21000 * 1.0; sn_gain = 0.5; break;
 		case SND_BALLBOMB:	disc_gain = 21000 * 1.0; sn_gain = 0.5; break;
 		case SND_INDIANBT:	disc_gain = 21000 * 0.25; sn_gain = 0.5; break;
@@ -2673,6 +2916,7 @@ static void sound_reset()
 		case SND_LAGUNAR:	zzzap_sound_reset(1); break;
 		case SND_BOOTHILL:	boothill_sound_reset(); break;
 		case SND_MWMUSIC:	mwmusic_sound_reset(); break;
+		case SND_SPCENCTR:	spcenctr_sound_reset(); break;
 	}
 
 	if (inv_extra) invaders_sound_reset(1);
@@ -2706,6 +2950,7 @@ static void sound_reset()
 				case SND_ZZZAP: case SND_LAGUNAR: zzzap_sound_step(); break;
 				case SND_BOOTHILL: { double l, r; boothill_sound_step(&l, &r); } break;
 				case SND_MWMUSIC: mwmusic_sound_step(); break;
+				case SND_SPCENCTR: spcenctr_sound_step(); break;
 			}
 		}
 	}
@@ -2722,6 +2967,7 @@ static void sound_relink()
 		case SND_POLARIS:	polaris_relink(); break;
 		case SND_BOOTHILL:	boothill_sound_relink(); break;
 		case SND_MWMUSIC:	mwmusic_sound_relink(); break;
+		case SND_SPCENCTR:	spcenctr_sound_relink(); break;
 	}
 }
 
@@ -2733,9 +2979,7 @@ static void sound_exit()
 	sn_chips = 0;
 }
 
-// ---------------------------------------------------------------------------
 // Sound / misc output ports
-
 static inline INT32 is_cocktail()
 {
 	return (DrvDips[4] & 0x02) ? 1 : 0;
@@ -3239,17 +3483,13 @@ static void rollingc_sh_port_w(UINT8 data)
 	port_3_last = data;
 }
 
-// ---------------------------------------------------------------------------
 // Shifter (MB14241)
-
 static inline void shift_count_w(UINT8 data) { shift_count = ~data & 7; }
 static inline void shift_data_w(UINT8 data) { shift_data = (data << 7) | (shift_data >> 8); }
 static inline UINT8 shift_result_r() { return (shift_data >> shift_count) & 0xff; }
 static inline UINT8 shift_result_rev_r() { return BITSWAP08(shift_result_r(), 0, 1, 2, 3, 4, 5, 6, 7); }
 
-// ---------------------------------------------------------------------------
-// Inputs: the "control ports" (fire / left / right) are placed into the ports here
-
+// Inputs
 static inline UINT8 ctrl_p1() { return DrvInP1 & 7; }
 static inline UINT8 ctrl_p2() { return (is_cocktail() ? DrvInP2 : (DrvInP1 | DrvInP2)) & 7; }
 
@@ -3275,9 +3515,7 @@ static UINT8 in_invaders(INT32 port)
 	return 0;
 }
 
-// ---------------------------------------------------------------------------
 // Main cpu handlers
-
 static UINT8 (*read_inputs)(INT32 port) = in_sicv;
 
 static void __fastcall mw_write(UINT16 address, UINT8 data)
@@ -3325,7 +3563,6 @@ static UINT8 __fastcall mw_read(UINT16 address)
 }
 
 // --- Midway "invaders" sound board games
-
 static void __fastcall invaders_out(UINT16 port, UINT8 data)
 {
 	switch (port & 7) {
@@ -3444,7 +3681,6 @@ static void __fastcall claybust_out(UINT16 port, UINT8 data)
 }
 
 // --- Taito color boards with samples
-
 static UINT8 __fastcall invadpt2_in(UINT16 port)
 {
 	switch (port & 0xff) {
@@ -3911,7 +4147,6 @@ static void __fastcall spacecom_out(UINT16 port, UINT8 data)
 }
 
 // --- Invader's Revenge sound cpu
-
 static void invrvnge_sound_write(UINT16 address, UINT8 data)
 {
 	switch (address) {
@@ -3930,15 +4165,14 @@ static UINT8 invrvnge_sound_read(UINT16 address)
 
 static UINT8 invrvnge_ay_porta(UINT32) { return soundlatch >> 1; }
 static UINT8 invrvnge_ay_portb(UINT32) { return 0xff; }
-// ---------------------------------------------------------------------------
-// Midway mw8080bw.cpp games: Sea Wolf, Gun Fight, Tornado Baseball, 280-ZZZAP,
+
+// Midway mw8080bw games: Sea Wolf, Gun Fight, Tornado Baseball, 280-ZZZAP,
 // Laguna Racer, Boot Hill, Desert Gun, Double Play, Extra Inning, M-4, Clowns,
 // Space Walk, Shuffleboard, Dog Patch, Space Encounters, Phantom II,
 // 4 Player Bowling Alley, Blue Shark
-
 static INT32 mw_pos_timer[4];
 
-// positional control (MAME PORT_POSITIONAL) moved by two digital inputs and/or an analog stick
+// positional control
 static INT32 mw_positional(INT32 idx, INT32 dec, INT32 inc, INT16 analog, INT32 positions, INT32 def, INT32 delay)
 {
 	if (mw_pos[idx] < 0) mw_pos[idx] = def;
@@ -3961,7 +4195,7 @@ static INT32 mw_positional(INT32 idx, INT32 dec, INT32 inc, INT16 analog, INT32 
 	return mw_pos[idx];
 }
 
-// non-centering paddle (MAME PORT_PADDLE with PORT_CENTERDELTA(0)), 0x00-0xff in mw_pos
+// non-centering paddle
 static UINT8 mw_paddle(INT32 idx, INT32 left, INT32 right, INT16 analog, INT32 min, INT32 max, INT32 def)
 {
 	if (mw_pos[idx] < 0) mw_pos[idx] = def;
@@ -3977,9 +4211,7 @@ static UINT8 mw_paddle(INT32 idx, INT32 left, INT32 right, INT16 analog, INT32 m
 	return p;
 }
 
-// ---------------------------------------------------------------------------
 // Sea Wolf
-
 static const UINT8 seawolf_controller_table[30] = {
 	0x1e, 0x1c, 0x1d, 0x19, 0x18, 0x1a, 0x1b, 0x13, 0x12, 0x10, 0x11, 0x15, 0x14, 0x16, 0x17, 0x07,
 	0x06, 0x04, 0x05, 0x01, 0x00, 0x02, 0x03, 0x0b, 0x0a, 0x08, 0x09, 0x0d, 0x0c, 0x0e
@@ -3987,7 +4219,7 @@ static const UINT8 seawolf_controller_table[30] = {
 
 // periscope: BurnGun, only the horizontal position is used.  The reticle is
 // kept on a fixed line, the periscope only turns left / right.
-#define SEAWOLF_RETICLE_Y	72
+#define SEAWOLF_RETICLE_Y	32
 
 static void seawolf_frame()
 {
@@ -4002,14 +4234,14 @@ static void seawolf_frame()
 	BurnGunX[0] = x << 8;
 	BurnGunY[0] = (SEAWOLF_RETICLE_Y - 8) << 8;
 
-	INT32 pos = ((x + 8) * 30) / nScreenWidth;	// 30 positions across the screen
+	INT32 pos = ((x + 8 - 16) * 30) / (nScreenWidth - 28);	// 30 positions
 	if (pos < 0) pos = 0;
 	if (pos > 29) pos = 29;
 
 	mw_analog[0] = seawolf_controller_table[pos] ^ 0x1f;
 }
 
-// artwork lamps (MAME seawolf.lay output names)
+// artwork lamps
 static void seawolf_explosion_lamp_w(UINT8 data)
 {
 	static const UINT8 bits_for_lamps[16] = {
@@ -4030,7 +4262,6 @@ static void seawolf_periscope_lamp_w(UINT8 data)
 {
 	mw_lamps[1] = data;
 
-	// torpedo lamp order confirmed by the software (see MAME)
 	BurnOutputSet("TORP_LAMP_4", (data >> 0) & 1);
 	BurnOutputSet("TORP_LAMP_3", (data >> 1) & 1);
 	BurnOutputSet("TORP_LAMP_2", (data >> 2) & 1);
@@ -4067,9 +4298,7 @@ static void __fastcall seawolf_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Gun Fight
-
 static const UINT8 gunfight_controller_table[7] = { 0x06, 0x02, 0x00, 0x04, 0x05, 0x01, 0x03 };
 
 static void gunfight_frame()
@@ -4096,9 +4325,7 @@ static void __fastcall gunfight_out(UINT16 port, UINT8 data)
 	if (port & 4) shift_data_w(data);
 }
 
-// ---------------------------------------------------------------------------
 // Tornado Baseball (upright, P1/P2 hit buttons)
-
 static UINT8 __fastcall tornbase_in(UINT16 port)
 {
 	switch (port & 3) {
@@ -4116,9 +4343,7 @@ static void __fastcall tornbase_out(UINT16 port, UINT8 data)
 	if (port & 4) shift_data_w(data);
 }
 
-// ---------------------------------------------------------------------------
 // 280-ZZZAP / Laguna Racer
-
 static void zzzap_frame()
 {
 	// gear shifter (toggle)
@@ -4165,9 +4390,7 @@ static void __fastcall zzzap_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Boot Hill
-
 static const UINT8 boothill_controller_table[7] = { 0x00, 0x04, 0x06, 0x07, 0x03, 0x01, 0x05 };
 
 static void boothill_frame()
@@ -4205,9 +4428,7 @@ static void __fastcall boothill_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Desert Gun / Road Runner
-
 static void desertgu_frame()
 {
 	BurnGunMakeInputs(0, DrvAnalog[0], DrvAnalog[1]);
@@ -4238,9 +4459,7 @@ static void __fastcall desertgu_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Double Play / Extra Inning (upright: both sides read the left pitch controls)
-
 static UINT8 __fastcall dplay_in(UINT16 port)
 {
 	switch (port & 3) {
@@ -4263,9 +4482,7 @@ static void __fastcall dplay_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // M-4
-
 static UINT8 __fastcall m4_in(UINT16 port)
 {
 	if ((port & 3) == 3) return shift_reverse ? shift_result_rev_r() : shift_result_r();
@@ -4308,9 +4525,7 @@ static void gmissile_sound_w(UINT8 data)
 	if (rising & 0x80) splaych(3, 1, 0.25);	// right explosion
 }
 
-// ---------------------------------------------------------------------------
 // Clowns / Space Walk
-
 static void clowns_frame()
 {
 	mw_analog[0] = mw_paddle(0, DrvJoyX[0], DrvJoyX[1], DrvAnalog[0], 0x01, 0xfe, 0x7f);
@@ -4352,9 +4567,7 @@ static void __fastcall clowns_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Shuffleboard / 4 Player Bowling Alley (trackball)
-
 static void trackball_frame()
 {
 	BurnTrackballConfig(0, AXIS_REVERSED, AXIS_NORMAL);
@@ -4387,7 +4600,7 @@ static void __fastcall shuffle_out(UINT16 port, UINT8 data)
 
 static UINT8 __fastcall bowler_in(UINT16 port)
 {
-	if ((port & 0x0f) == 1) return ~shift_result_r();	// inverted, see MAME
+	if ((port & 0x0f) == 1) return ~shift_result_r();
 	return shuffle_in(port);
 }
 
@@ -4400,9 +4613,7 @@ static void __fastcall bowler_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Dog Patch
-
 static const UINT8 dogpatch_controller_table[7] = { 0x07, 0x06, 0x04, 0x05, 0x01, 0x00, 0x02 };
 
 static void dogpatch_frame()
@@ -4433,9 +4644,7 @@ static void __fastcall dogpatch_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Space Encounters
-
 static const UINT8 spcenctr_controller_table[64] = {
 	0x3f, 0x3e, 0x3c, 0x3d, 0x39, 0x38, 0x3a, 0x3b, 0x33, 0x32, 0x30, 0x31, 0x35, 0x34, 0x36, 0x37,
 	0x27, 0x26, 0x24, 0x25, 0x21, 0x20, 0x22, 0x23, 0x2b, 0x2a, 0x28, 0x29, 0x2d, 0x2c, 0x2e, 0x2f,
@@ -4443,8 +4652,42 @@ static const UINT8 spcenctr_controller_table[64] = {
 	0x17, 0x16, 0x14, 0x15, 0x11, 0x10, 0x12, 0x13, 0x1b, 0x1a, 0x18, 0x19, 0x1d, 0x1c, 0x1e, 0x1f
 };
 
+// "LAMP" (damage, orange-red) and "STROBE" (white flash, 555 at 9Hz with a 5% on time)
+// light up the screen through the bezel
+static double spcenctr_strobe_phase;
+
+static void spcenctr_lights_frame()
+{
+	const double period = 1.0 / 9.0, on_from = period * 0.95;
+	const double frame_time = 1.0 / (19968000.0 / 4 / 320 / 262);
+	double on = 0;
+
+	// how much of this frame the strobe was on (the 5.5ms flash is shorter than a frame)
+	for (INT32 i = 0; i < 16; i++) {
+		double t = fmod(spcenctr_strobe_phase + frame_time * (i + 0.5) / 16, period);
+		if (t >= on_from) on += 1.0 / 16;
+	}
+	spcenctr_strobe_phase = fmod(spcenctr_strobe_phase + frame_time, period);
+	if (!sec.strobe_enable) on = 0;
+
+	INT32 strobe = (on > 0) ? 1 : 0;
+	BurnOutputSet("LAMP", sec.lamp);
+	BurnOutputSet("STROBE", strobe);
+
+	light_add_r = light_add_g = light_add_b = 0;
+	if (!BurnArtworkActive()) {
+		// a 5.5ms flash on a CRT shows as a full white frame, scale it up a bit
+		double s = on * 3.0; if (s > 1.0) s = 1.0;
+		light_add_r = (INT32)(255 * (0.5   * sec.lamp + 0.7 * s));
+		light_add_g = (INT32)(255 * (0.125 * sec.lamp + 0.7 * s));
+		light_add_b = (INT32)(255 * (0.05  * sec.lamp + 0.7 * s));
+	}
+}
+
 static void spcenctr_frame()
 {
+	spcenctr_lights_frame();
+
 	INT32 x = mw_positional(0, DrvJoyX[0], DrvJoyX[1], DrvAnalog[0], 35, 17, 1);
 	INT32 y = mw_positional(1, DrvJoyX[2], DrvJoyX[3], DrvAnalog[1], 20, 9, 2);
 	mw_analog[0] = spcenctr_controller_table[12 + (34 - x)];
@@ -4466,16 +4709,24 @@ static void __fastcall spcenctr_out(UINT16 port, UINT8 data)
 	port &= 0xff;
 
 	if ((port & 0x07) == 0x00) bright_control = (~data >> 3) & 1;
-	else if ((port & 0x5f) == 0x01 || (port & 0x5f) == 0x09 || (port & 0x5f) == 0x11) { /* sound (not emulated) */ }
+	else if ((port & 0x5f) == 0x01) { snd_sync(); spcenctr_sound_p1_w(data); }
+	else if ((port & 0x5f) == 0x09) { snd_sync(); spcenctr_sound_p2_w(data); }
+	else if ((port & 0x5f) == 0x11) {
+		snd_sync();
+		// bit 0: screech (not emulated yet)
+		sec.enemy_shot = (data >> 1) & 1;
+		sec.strobe_enable = (data >> 2) & 1;
+		sec.lamp = (data >> 3) & 1;
+		sec.bonus = (data >> 4) & 1;
+		SN76477_enable_w(0, (data >> 5) & 1);
+	}
 	else if ((port & 0x07) == 0x02) BurnWatchdogWrite();
 	else if ((port & 0x07) == 0x03) trench_slope[BITSWAP08(port, 0, 0, 0, 0, 7, 6, 4, 3) & 0x0f] = data;
 	else if ((port & 0x07) == 0x04) trench_center = data;
 	else if ((port & 0x07) == 0x07) trench_width = data;
 }
 
-// ---------------------------------------------------------------------------
 // Phantom II
-
 static UINT8 __fastcall phantom2_in(UINT16 port)
 {
 	switch (port & 3) {
@@ -4508,9 +4759,7 @@ static void __fastcall phantom2_out(UINT16 port, UINT8 data)
 	}
 }
 
-// ---------------------------------------------------------------------------
 // Blue Shark
-
 static void blueshrk_frame()
 {
 	mw_analog[0] = mw_paddle(0, DrvJoyX[0], DrvJoyX[1], DrvAnalog[0], 0x08, 0x82, 0x45);
@@ -4535,8 +4784,6 @@ static void __fastcall blueshrk_out(UINT16 port, UINT8 data)
 		case 4: BurnWatchdogWrite(); return;
 	}
 }
-// ---------------------------------------------------------------------------
-// Machine
 
 static INT32 DrvDoReset(INT32 clear_mem)
 {
@@ -4570,6 +4817,8 @@ static INT32 DrvDoReset(INT32 clear_mem)
 	trench_width = trench_center = bright_control = brightness = 0;
 	memset(trench_slope, 0, sizeof(trench_slope));
 	phantom2_cloud_counter = PHANTOM2_CLOUD_COUNTER_START;
+	light_add_r = light_add_g = light_add_b = 0;
+	spcenctr_strobe_phase = 0;
 	if (cfg->out == seawolf_out) {
 		seawolf_explosion_lamp_w(0);
 		seawolf_periscope_lamp_w(0);
@@ -4635,6 +4884,8 @@ static INT32 MemIndex()
 #define R_SOUND			2
 #define R_PROM			3
 #define R_USER			4
+#define R_NIBHI			5	// 4-bit proms: main cpu high nibble
+#define R_NIBLO			6	// 4-bit proms: main cpu low nibble
 
 static INT32 DrvLoadRoms()
 {
@@ -4669,6 +4920,20 @@ static INT32 DrvLoadRoms()
 
 			case R_USER:
 				if (BurnLoadRom(DrvUser1 + offs, i, 1)) return 1;
+			break;
+
+			case R_NIBHI:
+			case R_NIBLO: {
+				UINT8 *tmp = (UINT8*)BurnMalloc(ri.nLen);
+				if (BurnLoadRom(tmp, i, 1)) { BurnFree(tmp); return 1; }
+				for (UINT32 j = 0; j < ri.nLen; j++) {
+					if ((ri.nType & 0x0f) == R_NIBHI)
+						DrvI8080ROM[offs + j] = (DrvI8080ROM[offs + j] & 0x0f) | (tmp[j] << 4);
+					else
+						DrvI8080ROM[offs + j] = (DrvI8080ROM[offs + j] & 0xf0) | (tmp[j] & 0x0f);
+				}
+				BurnFree(tmp);
+			}
 			break;
 		}
 	}
@@ -4777,6 +5042,8 @@ static INT32 DrvInit(const mw_config *config, const ovl_layout *ovl, void (*decr
 	sound_init();
 
 	if (cfg->video == VID_COSMO) cosmo_stars_init();
+
+	draw_xoffs = (cfg->video == VID_SPCENCTR) ? 4 : 0;
 
 	GenericTilesInit();
 	overlay_build();
@@ -4915,11 +5182,11 @@ static INT32 DrvFrame()
 
 		if (cfg->irq_type == 0)
 		{
-			if (i == 95 && ActiveZ80GetIFF1()) {
+			if (i == 95 && ZetIFF1()) {
 				ZetSetVector(0xcf);		// rst 08h
 				ZetSetIRQLine(0, CPU_IRQSTATUS_HOLD);
 			}
-			if (i == 223 && ActiveZ80GetIFF1()) {
+			if (i == 223 && ZetIFF1()) {
 				ZetSetVector(0xd7);		// rst 10h
 				ZetSetIRQLine(0, CPU_IRQSTATUS_HOLD);
 			}
@@ -5055,6 +5322,7 @@ static INT32 DrvScan(INT32 nAction, INT32 *pnMin)
 			case SND_LAGUNAR:	SCAN_VAR(zz); break;
 			case SND_BOOTHILL:	SCAN_VAR(bh); break;
 			case SND_MWMUSIC:	SCAN_VAR(mwmus); break;
+			case SND_SPCENCTR:	SCAN_VAR(sec); SCAN_VAR(spcenctr_strobe_phase); break;
 		}
 
 		if (nAction & ACB_WRITE) {
@@ -5069,8 +5337,6 @@ static INT32 DrvScan(INT32 nAction, INT32 *pnMin)
 
 	return 0;
 }
-// ---------------------------------------------------------------------------
-// Inputs
 
 #define DIP_ENTRIES \
 	{"Dip A",			BIT_DIPSWITCH,	DrvDips + 0,	"dip"		}, \
@@ -5515,10 +5781,6 @@ static struct BurnInputInfo CheckmatInputList[] = {
 };
 
 STDINPUTINFO(Checkmat)
-
-// ---------------------------------------------------------------------------
-// Dip switches.  0-3 = IN0-IN3 defaults (active low bits are set here),
-// 4 = fake: bit 0 color overlay, bit 1 cocktail cabinet
 
 #define FAKE_DIPS(o, def) \
 	{(o)+4, 0xff, 0xff, def, NULL							}, \
@@ -6587,8 +6849,6 @@ static struct BurnDIPInfo CheckmatDIPList[]=
 };
 
 STDDIPINFO(Checkmat)
-// ---------------------------------------------------------------------------
-// Inputs / DIPs for the Midway mw8080bw.cpp games (DIPs converted from MAME)
 
 #define A(a, b, c, d) {a, b, (UINT8*)(c), d}
 static struct BurnInputInfo SeawolfInputList[] = {
@@ -7551,9 +7811,7 @@ static struct BurnDIPInfo BlueshrkDIPList[]=
 
 STDDIPINFO(Blueshrk)
 
-// ---------------------------------------------------------------------------
 // Midway: Amazing Maze, Guided Missile, Checkmate
-
 static void __fastcall maze_out(UINT16 port, UINT8 data)
 {
 	if (port & 0x02) BurnWatchdogWrite();
@@ -7597,9 +7855,7 @@ static UINT8 in_jspecter(INT32 port)
 	return ret;
 }
 
-// ---------------------------------------------------------------------------
 // Machine configurations
-
 #define MW_CLOCK	1996800
 
 //                                      video          sound          pal  out              in               map  clock     irq  watchdog
@@ -7644,9 +7900,7 @@ static const mw_config cfg_maze       = { VID_MW,       SND_NONE,      2, maze_o
 static const mw_config cfg_gmissile   = { VID_MW,       SND_SAMPLESONLY,     2, gmissile_out,    gmissile_in,     0, MW_CLOCK,  0, 255, NULL };
 static const mw_config cfg_checkmat   = { VID_MW,       SND_NONE,      2, checkmat_out,    checkmat_in,     0, MW_CLOCK,  0, 180, NULL };
 
-// ---------------------------------------------------------------------------
 // Decryption / rom patches
-
 static void invrvnge_decrypt()
 {
 	for (INT32 i = 0; i < 0x800; i++) {
@@ -7748,9 +8002,8 @@ static INT32 MwInit(const mw_config *config, const ovl_layout *ovl, UINT8 (*inpu
 	flip_mode = flip;
 	return DrvInit(config, ovl, decrypt);
 }
-// ---------------------------------------------------------------------------
-// Midway mw8080bw.cpp games: configurations and samples
 
+// Midway mw8080bw games: configurations and samples
 //                                      video          sound            pal  out              in               map  clock     irq  watchdog  frame
 static const mw_config cfg_seawolf    = { VID_MW,       SND_SAMPLESONLY, 2, seawolf_out,     seawolf_in,      0, MW_CLOCK,  0, 0,   seawolf_frame  };
 static const mw_config cfg_gunfight   = { VID_MW,       SND_GUNFIGHT,    2, gunfight_out,    gunfight_in,     0, MW_CLOCK,  0, 0,   gunfight_frame };
@@ -7766,7 +8019,7 @@ static const mw_config cfg_spacwalk   = { VID_MW,       SND_MWMUSIC,     2, clow
 static const mw_config cfg_shuffle    = { VID_MW,       SND_NONE,        2, shuffle_out,     shuffle_in,      0, MW_CLOCK,  0, 255, trackball_frame };
 static const mw_config cfg_bowler     = { VID_MW,       SND_NONE,        2, bowler_out,      bowler_in,       0, MW_CLOCK,  0, 255, trackball_frame };
 static const mw_config cfg_dogpatch   = { VID_MW,       SND_MWMUSIC,     2, dogpatch_out,    dogpatch_in,     0, MW_CLOCK,  0, 255, dogpatch_frame };
-static const mw_config cfg_spcenctr   = { VID_SPCENCTR, SND_NONE,        6, spcenctr_out,    spcenctr_in,     0, MW_CLOCK,  0, 255, spcenctr_frame };
+static const mw_config cfg_spcenctr   = { VID_SPCENCTR, SND_SPCENCTR,    6, spcenctr_out,    spcenctr_in,     0, MW_CLOCK,  0, 255, spcenctr_frame };
 static const mw_config cfg_phantom2   = { VID_PHANTOM2, SND_SAMPLESONLY, 6, phantom2_out,    phantom2_in,     0, MW_CLOCK,  0, 255, NULL           };
 static const mw_config cfg_blueshrk   = { VID_MW,       SND_NONE,        2, blueshrk_out,    blueshrk_in,     0, MW_CLOCK,  0, 255, blueshrk_frame };
 
@@ -7816,9 +8069,8 @@ static struct BurnSampleInfo Phantom2SampleDesc[] = {
 
 STD_SAMPLE_PICK(Phantom2)
 STD_SAMPLE_FN(Phantom2)
-// ---------------------------------------------------------------------------
-// Init wrappers
 
+// Init wrappers
 static INT32 Init0() { return MwInit(&cfg_seawolf, &seawolf_overlay, in_sicv, 0, NULL); }
 static INT32 Init1() { return MwInit(&cfg_gunfight, &gunfight_overlay, in_sicv, 0, NULL); }
 static INT32 Init2() { return MwInit(&cfg_tornbase, NULL, in_sicv, 0, NULL); }
@@ -7883,9 +8135,6 @@ static INT32 Init60() { return MwInit(&cfg_orbite, NULL, in_sicv, 0, NULL); }
 static INT32 Init61() { return MwInit(&cfg_astropal, NULL, in_sicv, 0, NULL); }
 static INT32 Init62() { return MwInit(&cfg_attackfc, &attackfc_overlay, in_sicv, 0, attackfc_decrypt); }
 static INT32 Init63() { return MwInit(&cfg_attackfcu, &attackfc_overlay, in_sicv, 0, NULL); }
-
-// ---------------------------------------------------------------------------
-// Drivers (rom lists generated from MAME 8080bw.cpp / mw8080bw.cpp)
 
 // Sea Wolf (set 1)
 
@@ -8456,7 +8705,7 @@ struct BurnDriver BurnDrvSpcenctr = {
 	BDF_GAME_WORKING | BDF_HISCORE_SUPPORTED, 2, HARDWARE_MISC_PRE90S, GBF_SHOOT, 0,
 	NULL, spcenctrRomInfo, spcenctrRomName, NULL, NULL, NULL, NULL, SpcenctrInputInfo, SpcenctrDIPInfo,
 	Init16, DrvExit, DrvFrame, DrvDraw, DrvScan, &DrvRecalc, 0x1000,
-	260, 224, 4, 3
+	252, 224, 4, 3
 };
 
 // Phantom II
@@ -9176,7 +9425,18 @@ struct BurnDriver BurnDrvSpaceatt = {
 // Space Attack (bootleg of Space Invaders, bproms)
 
 static struct BurnRomInfo spaceattbpRomDesc[] = {
-
+	{ "06e.bin",             0x0400, 0x68301d05, MW_ROM(R_NIBHI, 0x0000) | BRF_PRG | BRF_ESS }, //  0 i8080 code (high nibble)
+	{ "12l.bin",             0x0400, 0xc5a5228f, MW_ROM(R_NIBLO, 0x0000) | BRF_PRG | BRF_ESS }, //  1 i8080 code (low nibble)
+	{ "05de.bin",            0x0400, 0x42032c14, MW_ROM(R_NIBHI, 0x0400) | BRF_PRG | BRF_ESS }, //  2 i8080 code (high nibble)
+	{ "11hl.bin",            0x0400, 0xd5d3811a, MW_ROM(R_NIBLO, 0x0400) | BRF_PRG | BRF_ESS }, //  3 i8080 code (low nibble)
+	{ "04d.bin",             0x0400, 0x5f5e540c, MW_ROM(R_NIBHI, 0x0800) | BRF_PRG | BRF_ESS }, //  4 i8080 code (high nibble)
+	{ "10h.bin",             0x0400, 0x9d5ef6f1, MW_ROM(R_NIBLO, 0x0800) | BRF_PRG | BRF_ESS }, //  5 i8080 code (low nibble)
+	{ "03b.bin",             0x0400, 0x89e13008, MW_ROM(R_NIBHI, 0x1400) | BRF_PRG | BRF_ESS }, //  6 i8080 code (high nibble)
+	{ "09g.bin",             0x0400, 0xc16f5503, MW_ROM(R_NIBLO, 0x1400) | BRF_PRG | BRF_ESS }, //  7 i8080 code (low nibble)
+	{ "02ab.bin",            0x0400, 0xffa166c2, MW_ROM(R_NIBHI, 0x1800) | BRF_PRG | BRF_ESS }, //  8 i8080 code (high nibble)
+	{ "08f.bin",             0x0400, 0xb5fa1a2b, MW_ROM(R_NIBLO, 0x1800) | BRF_PRG | BRF_ESS }, //  9 i8080 code (low nibble)
+	{ "01a.bin",             0x0400, 0x44f8e99c, MW_ROM(R_NIBHI, 0x1c00) | BRF_PRG | BRF_ESS }, // 10 i8080 code (high nibble)
+	{ "07ef.bin",            0x0400, 0x9560880d, MW_ROM(R_NIBLO, 0x1c00) | BRF_PRG | BRF_ESS }, // 11 i8080 code (low nibble)
 };
 
 STD_ROM_PICK(spaceattbp)
@@ -9861,7 +10121,7 @@ static struct BurnRomInfo tst_invdRomDesc[] = {
 STD_ROM_PICK(tst_invd)
 STD_ROM_FN(tst_invd)
 
-struct BurnDriver BurnDrvTst_invd = {
+struct BurnDriverD BurnDrvTst_invd = {
 	"tst_invd", "invaders", NULL, NULL, "19??",
 	"Space Invaders Test ROM\0", NULL, "<unknown>", "Miscellaneous",
 	NULL, NULL, NULL, NULL,
@@ -10633,6 +10893,31 @@ struct BurnDriver BurnDrvLupin3a = {
 	224, 260, 3, 4
 };
 
+// Yosaku HB remake
+
+static struct BurnRomInfo yosakuRomDesc[] = {
+	{ "ylp12.bin",            0x0800, 0x19bc1db4, MW_ROM(R_MAIN, 0x0000) | BRF_PRG | BRF_ESS }, //  0 i8080 code
+	{ "ylp13.bin",            0x0800, 0x1fb43a59, MW_ROM(R_MAIN, 0x0800) | BRF_PRG | BRF_ESS }, //  1 i8080 code
+	{ "ylp14.bin",            0x0800, 0xc418d5a3, MW_ROM(R_MAIN, 0x1000) | BRF_PRG | BRF_ESS }, //  2 i8080 code
+	{ "ylp15.bin",            0x0800, 0xb76d9e6f, MW_ROM(R_MAIN, 0x1800) | BRF_PRG | BRF_ESS }, //  3 i8080 code
+	{ "ylp16.bin",            0x0800, 0x3f55d17f, MW_ROM(R_MAIN, 0x4000) | BRF_PRG | BRF_ESS }, //  4 i8080 code
+	{ "ylp17.bin",            0x0800, 0x3f55d17f, MW_ROM(R_MAIN, 0x4800) | BRF_PRG | BRF_ESS }, //  5 i8080 code
+	{ "ylp18.bin",            0x0800, 0x3f55d17f, MW_ROM(R_MAIN, 0x5000) | BRF_PRG | BRF_ESS }, //  6 i8080 code
+};
+
+STD_ROM_PICK(yosaku)
+STD_ROM_FN(yosaku)
+
+struct BurnDriver BurnDrvYosaku = {
+	"yosaku", NULL, NULL, "yosaku", "1980",
+	"Yosaku (HB)\0", NULL, "SNK", "Miscellaneous",
+	NULL, NULL, NULL, NULL,
+	BDF_GAME_WORKING | BDF_ORIENTATION_VERTICAL | BDF_HISCORE_SUPPORTED | BDF_HOMEBREW, 2, HARDWARE_MISC_PRE90S, GBF_ACTION, 0,
+	NULL, yosakuRomInfo, yosakuRomName, NULL, NULL, Lupin3SampleInfo, Lupin3SampleName, Lupin3InputInfo, Lupin3aDIPInfo,
+	Init40, DrvExit, DrvFrame, DrvDraw, DrvScan, &DrvRecalc, 0x1000,
+	224, 260, 3, 4
+};
+
 // Polaris (latest version)
 
 static struct BurnRomInfo polarisRomDesc[] = {
@@ -11060,8 +11345,8 @@ static struct BurnRomInfo starw1RomDesc[] = {
 	{ "gc.80",               0x0400, 0x4c67957b, MW_ROM(R_MAIN, 0x1400) | BRF_PRG | BRF_ESS }, //  3 i8080 code
 	{ "gc.81",               0x0400, 0x246621ef, MW_ROM(R_MAIN, 0x1800) | BRF_PRG | BRF_ESS }, //  4 i8080 code
 	{ "gc.82",               0x0400, 0x19bd32ee, MW_ROM(R_MAIN, 0x1c00) | BRF_PRG | BRF_ESS }, //  5 i8080 code
-	{ "cv01",                0x0400, 0x8d892ef3, MW_ROM(R_PROM, 0x0000) | BRF_GRA }, //  6 color proms
-	{ "cv02",                0x0400, 0xb44ddde8, MW_ROM(R_PROM, 0x0400) | BRF_GRA }, //  7 color proms
+	{ "cv01",                0x0800, 0x8d892ef3, MW_ROM(R_PROM, 0x0000) | BRF_GRA }, //  6 color proms
+	{ "cv02",                0x0800, 0xb44ddde8, MW_ROM(R_PROM, 0x0400) | BRF_GRA }, //  7 color proms
 };
 
 STD_ROM_PICK(starw1)

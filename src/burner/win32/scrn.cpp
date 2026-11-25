@@ -12,45 +12,14 @@ int nActiveGame;
 
 static bool bLoading = 0;
 
-#ifdef BUILD_PCE
-static void SetPCECDTitle()
+static void SetCDTitle()
 {
 	TCHAR szText[1024] = _T("");
-	TCHAR* pszTitle = PceCDInfo_Text(DRV_FULLNAME);
+	TCHAR* pszTitle = CDInfo_Text(DRV_FULLNAME);
 	_sntprintf(szText, _countof(szText), _T(APP_TITLE) _T(" v%.20s") _T(SEPERATOR_1) _T("%s") _T(SEPERATOR_1) _T("%s"), szAppBurnVer, BurnDrvGetText(DRV_FULLNAME), pszTitle ? pszTitle : FBALoadStringEx(hAppInst, IDS_UNIDENTIFIED_CD, true));
 	szText[_countof(szText) - 1] = _T('\0');
 	SetWindowText(hScrnWnd, szText);
 }
-#endif
-
-#ifdef BUILD_MEGADRIVE
-static void SetSegaCDTitle()
-{
-	TCHAR szText[1024] = _T("");
-	TCHAR* pszTitle = SegaCDInfo_Text(DRV_FULLNAME);
-	_sntprintf(szText, _countof(szText), _T(APP_TITLE) _T(" v%.20s") _T(SEPERATOR_1) _T("%s") _T(SEPERATOR_1) _T("%s"), szAppBurnVer, BurnDrvGetText(DRV_FULLNAME), pszTitle ? pszTitle : FBALoadStringEx(hAppInst, IDS_UNIDENTIFIED_CD, true));
-	szText[_countof(szText) - 1] = _T('\0');
-	SetWindowText(hScrnWnd, szText);
-}
-#endif
-
-#ifdef BUILD_NEOGEO
-static void SetNeoCDTitle(TCHAR* pszTitle)
-{
-	TCHAR szText[1024] = _T("");
-	_sntprintf(szText, _countof(szText), _T(APP_TITLE) _T(" v%.20s") _T(SEPERATOR_1) _T("%s") _T(SEPERATOR_1) _T("%s"), szAppBurnVer, BurnDrvGetText(DRV_FULLNAME), pszTitle);
-	szText[_countof(szText) - 1] = _T('\0');
-	SetWindowText(hScrnWnd, szText);
-}
-
-void NeoCDInfo_SetTitle()
-{
-	if (!IsNeoGeoCD()) return;
-	TCHAR* pszTitle = NeoCDInfo_Text(DRV_FULLNAME);
-	SetNeoCDTitle(pszTitle ? pszTitle : FBALoadStringEx(hAppInst, IDS_UNIDENTIFIED_CD, true));
-}
-#endif
-
 
 // ----------------------------------------------------------------------------
 // disc change (multi-disc games), for every cd system whose driver handles the tray
@@ -1103,8 +1072,6 @@ static LRESULT CALLBACK ScrnProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lPar
 				}
 				default:
 				{
-					COLORREF clr;
-
 					HBRUSH hbr = CreateSolidBrush(uiTextFontColor);
 
 					FillRect(pdis->hDC, &pdis->rcItem, hbr);
@@ -1338,15 +1305,6 @@ void PausedRedraw(void)
 
 		pBurnSoundOut = pBtemp;
 	}
-}
-
-static INT32 ScrnHasBezel()
-{
-	if (!nVidFullscreen && hBezelBitmap != NULL) {
-		return 1;
-	}
-
-	return 0;
 }
 
 struct t_hw_Struct {
@@ -1642,6 +1600,27 @@ static void QuitGame()
 	}
 }
 
+// cd systems are flagged as boardROM (bios), they are still launched (with a disc)
+bool BurnerDrvIsCDSystem()
+{
+	const UINT32 nHardware = BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK;
+	return (nHardware == HARDWARE_SNK_NEOCD || nHardware == HARDWARE_PCENGINE_PCE_CD || nHardware == HARDWARE_SEGA_MEGACD);
+}
+
+static INT32 CDSystemGetDrvIndex(const TCHAR* pszDrvName)
+{
+	const UINT32 nOldDrvActive = nBurnDrvActive;
+	INT32 nDrvIdx = BurnDrvGetIndex(_TtoA(pszDrvName));
+
+	if (nDrvIdx >= 0) {
+		nBurnDrvActive = nDrvIdx;
+		if (!BurnerDrvIsCDSystem()) nDrvIdx = -1;
+	}
+
+	nBurnDrvActive = nOldDrvActive;
+	return nDrvIdx;
+}
+
 // Compact driver loading module
 int BurnerLoadDriver(TCHAR *pszDriverName)
 {
@@ -1653,7 +1632,7 @@ int BurnerLoadDriver(TCHAR *pszDriverName)
 		_tcscpy(szBackup, szRomdataName);
 		RomDataExit();
 	}
-	if (bFinder = FindZipNameFromDats(szAppRomdataPath, _TtoA(pszDriverName), szRDDatBackup)) {
+	if ((bFinder = FindZipNameFromDats(szAppRomdataPath, _TtoA(pszDriverName), szRDDatBackup))) {
 		if ((nDrvIdx = RomDataCheck(szRDDatBackup)) >= 0) {
 			bRDMode = true;
 		}
@@ -1661,6 +1640,8 @@ int BurnerLoadDriver(TCHAR *pszDriverName)
 	if (!bFinder || !bRDMode) {
 		nDrvIdx = RomdataGetDrvIndex(pszDriverName);
 	}
+	if (nDrvIdx < 0)
+		nDrvIdx = CDSystemGetDrvIndex(pszDriverName);
 	if (nDrvIdx < 0)
 		return -1;
 
@@ -1901,7 +1882,7 @@ INT32 BurnerQuickLoad(const INT32 nMode, const TCHAR* pszSelect)
 					return -1;
 			}
 
-			nDrvIdx = RomdataGetDrvIndex(pszDrvName);
+			nDrvIdx = CDSystemGetDrvIndex(pszDrvName);
 			break;
 		}
 
@@ -2221,7 +2202,8 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 			nCDEmuSelect = 0;
 			TCHAR szFilter[100] = { 0 };
 			_stprintf(szFilter, _T("%s"), FBALoadStringEx(hAppInst, IDS_CD_SELECT_FILTER, true));
-			memcpy(szFilter + _tcslen(szFilter), _T(" (*.cue,*.chd)\0*.cue;*.chd\0\0"), 39 * sizeof(TCHAR));
+			static const TCHAR szPattern[] = _T(" (*.cue,*.chd)\0*.cue;*.chd\0");
+			memcpy(szFilter + _tcslen(szFilter), szPattern, sizeof(szPattern));
 			TCHAR szTitle[100] = { 0 };
 			_stprintf(szTitle, _T("%s"), FBALoadStringEx(hAppInst, IDS_CD_SELECT_IMAGE_TITLE, true));
 			if (UseDialogs() && !bDrvOkay) {
@@ -2991,7 +2973,6 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 					_tcsncat(szDir, _T("\\support\\shaders"), MAX_PATH - 1 - _tcslen(szDir));
 				}
 
-				OPENFILENAME ofn;
 				memset(&ofn, 0, sizeof(ofn));
 				ofn.lStructSize = sizeof(ofn);
 				ofn.hwndOwner = hScrnWnd;
@@ -4895,10 +4876,14 @@ int ScrnSize()
 	} else {
 		if (nWindowSize) {
 			nMaxSize = nWindowSize;
-			if (bDrvOkay && nWindowSize > 1 && nBmapWidth >= 400 && nBmapHeight >= 400) {
-				// For Popeye, Hole Land and Syvalion, MCR..etc. when running Windowed: Double Size
-				bprintf(PRINT_NORMAL, _T("  * Game is double-sized to begin with.\n"));
-				nMaxSize--;
+			if (BurnArtworkActive() == false) {
+				// AKA the hires-hack - keeps hires games relatively the same
+				// size as average games (256x224, .. etc)
+				if (bDrvOkay && nWindowSize > 1 && nBmapWidth >= 400 && nBmapHeight >= 400) {
+					// For Popeye, Hole Land and Syvalion, MCR..etc. when running Windowed: Double Size
+					bprintf(PRINT_NORMAL, _T("  * Game is double-sized to begin with.\n"));
+					nMaxSize--;
+				}
 			}
 		} else {
 			if (nBmapWidth < nBmapHeight) {
@@ -5078,23 +5063,10 @@ int ScrnTitle()
 			pszPosition += _stprintf(pszPosition, _T(SEPERATOR_2) _T("%s"), pszName);
 		}
 
-		if (IsNeoGeoCD()) {
-			NeoCDInfo_SetTitle();
+		if (IsCDGame()) {
+			SetCDTitle();
 			return 0;
 		}
-#ifdef BUILD_PCE
-		if ((BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK) == HARDWARE_PCENGINE_PCE_CD) {
-			SetPCECDTitle();
-			return 0;
-		}
-#endif
-#ifdef BUILD_MEGADRIVE
-		if ((BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK) == HARDWARE_SEGA_MEGACD) {
-			SetSegaCDTitle();
-			return 0;
-		}
-#endif
-
 	} else {
 		_stprintf(szText, _T(APP_TITLE) _T( " v%.20s") _T(SEPERATOR_1) _T("[%s]"), szAppBurnVer, FBALoadStringEx(hAppInst, IDS_SCRN_NOGAME, true));
 	}
@@ -5113,7 +5085,6 @@ int ScrnInit()
 	RECT rect;
 	int nWindowStyles, nWindowExStyles;
 
-	ScrnExitLua();
 	ScrnExit();
 
 	if (ScrnRegister() != 0) {
